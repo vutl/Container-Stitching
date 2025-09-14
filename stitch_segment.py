@@ -3,7 +3,6 @@ import numpy as np
 from pathlib import Path
 import argparse
 
-# Reuse helpers from stitch_generic if available
 try:
     from stitch_generic import container_roi, expand_canvas, get_detector, is_reasonable_transform, crop_final_mosaic
 except Exception:
