@@ -94,6 +94,8 @@ def main():
     ap.add_argument('--iou', type=float, default=0.6)
     ap.add_argument('--max-per-quad', type=int, default=1)
     ap.add_argument('--debug', action='store_true')
+    ap.add_argument('--fix-mode', choices=['none','snap','temporal'], default='snap',
+                    help='Automatic correction mode for mixed-container detections')
 
     ap.add_argument('--no-corners', action='store_true',
                     help='Skip gradient-based corner refinement outputs')
@@ -165,9 +167,190 @@ def main():
         h, w = img.shape[:2]
 
         # 1) detect
-        boxes, scores = run_detect(model, img, conf=args.conf, iou=args.iou)
-        boxes, scores = keep_best_per_quadrant(boxes, scores, w, h, args.max_per_quad)
+        boxes_all, scores_all = run_detect(model, img, conf=args.conf, iou=args.iou)
+
+        # keep a mapping of all candidates per quadrant so we can try
+        # alternative picks if the top-per-quadrant combination looks skewed
+        quads_all = {"TL": [], "TR": [], "BR": [], "BL": []}
+        for b, s in zip(boxes_all, scores_all):
+            cx, cy = box_center(b)
+            q = assign_quadrant(cx, cy, w, h)
+            quads_all[q].append((b, s))
+
+        boxes, scores = keep_best_per_quadrant(boxes_all, scores_all, w, h, args.max_per_quad)
         labels = ["det"] * len(boxes)
+
+        # track whether this frame was auto-corrected
+        corrected = False
+
+        # Post-filter: ensure left column corners (TL vs BL) and right column (TR vs BR)
+        # come from the same container / are horizontally consistent. If not, try
+        # alternatives from the original detections to reduce the mismatch.
+        def _box_x_center(box):
+            return 0.5 * (box[0] + box[2])
+
+        # build quick lookup for kept boxes by quadrant
+        kept_map = {}
+        for b, s in zip(boxes, scores):
+            cx, cy = box_center(b)
+            kept_map[assign_quadrant(cx, cy, w, h)] = (b, s)
+
+        # More aggressive fix: consider re-pairing top/bottom from ALL candidates
+        # within the left half and right half respectively. This helps when the
+        # top/bottom detections were assigned to different quadrants but belong
+        # to the same container column (mixed-container case).
+        def _repair_column(is_left: bool):
+            half_x = 0.5 * float(w)
+            # collect candidates in the requested half
+            cand = []
+            for b, s in zip(boxes_all, scores_all):
+                cx = 0.5 * (b[0] + b[2])
+                if (is_left and cx <= half_x) or (not is_left and cx > half_x):
+                    cand.append((b, s))
+            if len(cand) < 2:
+                return False
+            # choose top-most and bottom-most candidates by center y
+            cand_sorted = sorted(cand, key=lambda bs: 0.5 * (bs[0][1] + bs[0][3]))
+            top_cand, bot_cand = cand_sorted[0], cand_sorted[-1]
+            top_b, top_s = top_cand; bot_b, bot_s = bot_cand
+            top_x = 0.5 * (top_b[0] + top_b[2]); bot_x = 0.5 * (bot_b[0] + bot_b[2])
+
+            # compute current chosen pair (if any) for this half
+            cur_top = None; cur_bot = None
+            for bb in boxes:
+                cx = 0.5 * (bb[0] + bb[2]); cy = 0.5 * (bb[1] + bb[3])
+                if (is_left and cx <= half_x) or (not is_left and cx > half_x):
+                    # top if y is above median of this half
+                    pass
+            # find current top/bot by y among kept boxes in this half
+            kept_in_half = []
+            for bb, ss in zip(boxes, scores):
+                cx = 0.5 * (bb[0] + bb[2]); cy = 0.5 * (bb[1] + bb[3])
+                if (is_left and cx <= half_x) or (not is_left and cx > half_x):
+                    kept_in_half.append((bb, ss))
+            if len(kept_in_half) < 2:
+                # nothing to compare/replace
+                return False
+            kept_sorted = sorted(kept_in_half, key=lambda bs: 0.5 * (bs[0][1] + bs[0][3]))
+            cur_top_b, cur_top_s = kept_sorted[0]
+            cur_bot_b, cur_bot_s = kept_sorted[-1]
+            cur_dx = abs(0.5*(cur_top_b[0]+cur_top_b[2]) - 0.5*(cur_bot_b[0]+cur_bot_b[2]))
+            cand_dx = abs(top_x - bot_x)
+            thr = max(8.0, 0.06 * float(w))
+            # accept new pairing if it improves dx by 10% or goes below threshold
+            if cand_dx < 0.9 * cur_dx or cand_dx <= thr:
+                # replace kept boxes for top and bottom in this half
+                # find indices
+                def _replace_kept(old_bb, new_bb, new_s):
+                    for idx_bb, bb in enumerate(boxes):
+                        if bb == old_bb:
+                            boxes[idx_bb] = new_bb
+                            scores[idx_bb] = new_s
+                            return True
+                    return False
+
+                replaced_top = _replace_kept(cur_top_b, top_b, top_s)
+                replaced_bot = _replace_kept(cur_bot_b, bot_b, bot_s)
+                if replaced_top or replaced_bot:
+                    side = 'left' if is_left else 'right'
+                    print(f"[repair] re-paired {side} column at frame {i}: dx {cur_dx:.1f} -> {cand_dx:.1f}")
+                    return True
+            return False
+
+        _repair_column(True)
+        _repair_column(False)
+
+        # Strong override: if both left and right halves each contain at least
+        # two detection candidates, pick the top-most and bottom-most in each
+        # half (by center-y) and use those as TL/BL (left) and TR/BR (right).
+        left_half = []
+        right_half = []
+        half_x = 0.5 * float(w)
+        for b, s in zip(boxes_all, scores_all):
+            cx = 0.5 * (b[0] + b[2])
+            cy = 0.5 * (b[1] + b[3])
+            if cx <= half_x:
+                left_half.append((b, s, cy))
+            else:
+                right_half.append((b, s, cy))
+
+        if len(left_half) >= 2 and len(right_half) >= 2:
+            left_sorted = sorted(left_half, key=lambda t: t[2])
+            right_sorted = sorted(right_half, key=lambda t: t[2])
+            lt_b, lt_s, _ = left_sorted[0]
+            lb_b, lb_s, _ = left_sorted[-1]
+            rt_b, rt_s, _ = right_sorted[0]
+            rb_b, rb_s, _ = right_sorted[-1]
+            # assign boxes in order TL, TR, BR, BL
+            boxes = [lt_b, rt_b, rb_b, lb_b]
+            scores = [lt_s, rt_s, rb_s, lb_s]
+            labels = ["det"] * len(boxes)
+            print(f"[override] used per-half top/bottom pairing for frame {i}")
+
+        # If top/bottom in a column are far apart horizontally relative to their
+        # own box widths, treat this as a mixed-container detection and snap
+        # the lower-confidence box horizontally to the higher-confidence one.
+        def _snap_column(is_left: bool):
+            half_x = 0.5 * float(w)
+            # collect kept boxes in this half
+            kept_in_half = []
+            for idx_bb, (bb, ss, lab) in enumerate(zip(boxes, scores, labels)):
+                # do not touch boxes that are synthetic (pred_3)
+                if lab != 'det':
+                    continue
+                cx = 0.5 * (bb[0] + bb[2]); cy = 0.5 * (bb[1] + bb[3])
+                if (is_left and cx <= half_x) or (not is_left and cx > half_x):
+                    kept_in_half.append((idx_bb, bb, ss, cx, cy))
+            if len(kept_in_half) < 2:
+                return False
+            # decide top vs bottom by center y
+            kept_sorted = sorted(kept_in_half, key=lambda t: t[4])
+            top_idx, top_b, top_s, top_cx, top_cy = kept_sorted[0]
+            bot_idx, bot_b, bot_s, bot_cx, bot_cy = kept_sorted[-1]
+            dx = abs(top_cx - bot_cx)
+            top_w = abs(top_b[2] - top_b[0])
+            bot_w = abs(bot_b[2] - bot_b[0])
+            max_box_w = max(1.0, top_w, bot_w)
+            thr = max(12.0, 0.25 * max_box_w)
+            if dx <= thr:
+                return False
+            # choose which to move: move the one with lower confidence (None treated as low)
+            def _conf_val(s):
+                return -1.0 if s is None else float(s)
+            if _conf_val(top_s) >= _conf_val(bot_s):
+                # move bottom to top x
+                target_cx = top_cx
+                src_idx = bot_idx
+                src_box = bot_b
+            else:
+                target_cx = bot_cx
+                src_idx = top_idx
+                src_box = top_b
+
+            bw = src_box[2] - src_box[0]
+            half = bw / 2.0
+            new_x1 = target_cx - half
+            new_x2 = target_cx + half
+            # clamp
+            new_x1 = max(0.0, new_x1); new_x2 = min(float(w - 1), new_x2)
+            new_box = [new_x1, src_box[1], new_x2, src_box[3]]
+            # write back
+            boxes[src_idx] = new_box
+            print(f"[snap] frame {i} {'left' if is_left else 'right'} column: moved box idx {src_idx} to cx={target_cx:.1f} (dx was {dx:.1f}, thr {thr:.1f})")
+            return True
+
+        # apply correction depending on mode
+        if args.fix_mode == 'snap':
+            if _snap_column(True):
+                corrected = True
+            if _snap_column(False):
+                corrected = True
+        elif args.fix_mode == 'temporal':
+            # temporal mode not implemented here yet; placeholder
+            pass
+
+        if corrected:
+            print(f"[auto-correct] frame {i} corrected ({args.fix_mode})")
 
         # 2) only handle 3-corner case
         if len(boxes) == 3:

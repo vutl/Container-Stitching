@@ -93,11 +93,27 @@ def rect_fill_if_close(mask: np.ndarray, min_fill_ratio: float = 0.72) -> np.nda
     return mask
 
 
+def unsharp(img, radius=1.0, amount=1.1):
+    """Unsharp mask cơ bản: radius ~ sigma của Gaussian, amount 1.0–1.3."""
+    blur = cv2.GaussianBlur(img, (0, 0), radius)
+    sharp = cv2.addWeighted(img, 1.0 + amount, blur, -amount, 0)
+    return np.clip(sharp, 0, 255).astype(np.uint8)
+
+def edge_preserve_sharpen(img, amount=0.7):
+    """Sharpen giữ biên bằng bilateral -> bớt halo."""
+    base = cv2.bilateralFilter(img, d=0, sigmaColor=25, sigmaSpace=7)
+    detail = cv2.subtract(img, base)
+    out = cv2.addWeighted(img, 1.0, detail, amount, 0)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def get_detector():
     if hasattr(cv2, 'SIFT_create'):
         return cv2.SIFT_create(), 'SIFT'
     if hasattr(cv2, 'xfeatures2d') and hasattr(cv2.xfeatures2d, 'SIFT_create'):
         return cv2.xfeatures2d.SIFT_create(), 'SIFT'
+    if hasattr(cv2, cv2, 'AKAZE_create'):
+        return cv2.AKAZE_create(threshold=3e-4), 'AKAZE'
     return cv2.ORB_create(4000), 'ORB'
 
 
@@ -178,19 +194,19 @@ def expand_canvas(mosaic: np.ndarray,
     if new_w <= 0 or new_h <= 0 or new_w > max_size or new_h > max_size:
         return None, None
 
-    moved = cv2.warpPerspective(mosaic, T, (new_w, new_h), flags=cv2.INTER_LINEAR,
+    moved = cv2.warpPerspective(mosaic, T, (new_w, new_h), flags=cv2.INTER_LANCZOS4,
                                 borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
     h_final = T @ h_to_canvas
-    warped_new = cv2.warpPerspective(new_img, h_final, (new_w, new_h), flags=cv2.INTER_LINEAR,
+    warped_new = cv2.warpPerspective(new_img, h_final, (new_w, new_h), flags=cv2.INTER_LANCZOS4,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
 
     mask_src = np.ones((h, w), dtype=np.uint8) * 255
-    warped_mask_new = cv2.warpPerspective(mask_src, h_final, (new_w, new_h), flags=cv2.INTER_NEAREST,
+    warped_mask_new = cv2.warpPerspective(mask_src, h_final, (new_w, new_h), flags=cv2.INTER_LANCZOS4,
                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     mask_new = warped_mask_new > 0
 
     mask_mosaic = np.ones((h_canvas, w_canvas), dtype=np.uint8) * 255
-    moved_mask = cv2.warpPerspective(mask_mosaic, T, (new_w, new_h), flags=cv2.INTER_NEAREST,
+    moved_mask = cv2.warpPerspective(mask_mosaic, T, (new_w, new_h), flags=cv2.INTER_LANCZOS4,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     mask_old = moved_mask > 0
 
@@ -221,6 +237,9 @@ def expand_canvas(mosaic: np.ndarray,
     if np.any(overlap):
         mask_new_u8 = warped_mask_new.astype(np.uint8)
         mask_old_u8 = moved_mask.astype(np.uint8)
+        kernel = np.ones((3,3), np.uint8)
+        mask_new_u8 = cv2.erode(mask_new_u8, kernel, iterations=1)
+        mask_old_u8 = cv2.erode(mask_old_u8, kernel, iterations=1)
         dist_new = cv2.distanceTransform(mask_new_u8, cv2.DIST_L2, 5).astype(np.float32)
         dist_old = cv2.distanceTransform(mask_old_u8, cv2.DIST_L2, 5).astype(np.float32)
         dist_new = cv2.GaussianBlur(dist_new, (0, 0), sigmaX=6, sigmaY=6)
@@ -233,7 +252,7 @@ def expand_canvas(mosaic: np.ndarray,
         overlap_count = int(overlap.sum())
         MULTIBAND_THRESHOLD = 8000
         if use_multiband and overlap_count >= MULTIBAND_THRESHOLD:
-            def _pyramid_blend(A, B, WA, WB, levels=5):
+            def _pyramid_blend(A, B, WA, WB, levels=4):
                 # A,B: uint8 images, WA/WB: float32 weight maps in [0,1], single or 3 channels
                 A_f = A.astype(np.float32)
                 B_f = B.astype(np.float32)
@@ -380,6 +399,8 @@ def stitch_incremental_with_corners(image_paths: List[Path],
     base = _normalize_height(base, target_h)
     if base is None:
         raise FileNotFoundError(image_paths[0])
+    
+    base = unsharp(base, radius=1.0, amount=1.1)
 
     # Initialize mosaic with first image
     mosaic = base.copy()
@@ -419,6 +440,7 @@ def stitch_incremental_with_corners(image_paths: List[Path],
             print("  -> Skip missing frame")
             continue
         cur_img = _normalize_height(cur_img, target_h)
+        cur_img = unsharp(cur_img, radius=1.0, amount=1.1)
 
     # Get current frame mask: prefer precomputed mask PNG (<stem>_mask.png), else corners bbox
         cur_img_path = cur_path
@@ -599,6 +621,7 @@ def main():
             final = crop_final_mosaic_from_mask(mosaic, mosaic_mask)
     else:
         final = crop_final_mosaic_from_mask(mosaic, mosaic_mask)
+    final = edge_preserve_sharpen(final, amount=0.7)
     cv2.imwrite(str(out_path), final)
     print(f'Saved -> {out_path}')
 

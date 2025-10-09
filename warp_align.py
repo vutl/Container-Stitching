@@ -91,6 +91,70 @@ def load_frames(img_dir: Path, corners_dir: Path, img_suffix: str, corners_suffi
         bot_y = max(corners['BL'][1], corners['BR'][1])
         cont_h = float(bot_y - top_y)
         frames.append(Frame(i, img, corners, w, h, max(left, 0), max(right, 0), cont_h))
+    # Post-filter skewed corner frames BEFORE alignment. We use box-relative
+    # thresholds so mixed-container corner detections (one corner from each
+    # container) are caught. We will skip flagged frames but ensure we never
+    # drop 3 consecutive frames: for any run of >=3 flagged we keep the one
+    # with smallest error score.
+    def corner_score_and_flag(f: Frame, vx_frac: float = 0.18, hy_frac: float = 0.12):
+        c = f.corners
+        if not c or any(k not in c for k in ('TL','TR','BR','BL')):
+            return 10.0, True
+        tlx, tly = c['TL']; trx, try_ = c['TR']; brx, bry = c['BR']; blx, bly = c['BL']
+        left_x = 0.5*(tlx + blx); right_x = 0.5*(trx + brx)
+        top_y = 0.5*(tly + try_); bot_y = 0.5*(bly + bry)
+        box_w = max(1.0, right_x - left_x); box_h = max(1.0, bot_y - top_y)
+        dx_left = abs(tlx - blx); dx_right = abs(trx - brx)
+        dy_top = abs(tly - try_); dy_bot = abs(bly - bry)
+        dx_thresh = max(4.0, vx_frac * box_w)
+        dy_thresh = max(3.0, hy_frac * box_h)
+        fails = 0
+        if dx_left > dx_thresh: fails += 1
+        if dx_right > dx_thresh: fails += 1
+        if dy_top > dy_thresh: fails += 1
+        if dy_bot > dy_thresh: fails += 1
+        narrow = (box_w < 0.08 * float(f.w))
+        score = (dx_left/box_w) + (dx_right/box_w) + (dy_top/box_h) + (dy_bot/box_h)
+        is_bad = (fails >= 2) or (fails >= 1 and narrow)
+        return float(score), bool(is_bad)
+
+    flags = [False] * len(frames)
+    scores = [0.0] * len(frames)
+    for idx, fr in enumerate(frames):
+        sc, bad = corner_score_and_flag(fr)
+        flags[idx] = bad
+        scores[idx] = sc
+
+    # enforce no 3 consecutive flags
+    i = 0
+    to_keep = [True] * len(frames)
+    while i < len(frames):
+        if not flags[i]:
+            i += 1; continue
+        j = i
+        run = []
+        while j < len(frames) and flags[j]:
+            run.append(j); j += 1
+        if len(run) >= 3:
+            # keep the index with smallest score among run
+            best = min(run, key=lambda k: scores[k])
+            for k in run:
+                to_keep[k] = (k == best)
+        else:
+            for k in run:
+                to_keep[k] = False
+        i = j
+
+    kept_frames = []
+    skipped = []
+    for k, fr in enumerate(frames):
+        if to_keep[k]:
+            kept_frames.append(fr)
+        else:
+            skipped.append(fr.idx)
+    if skipped:
+        print(f"Skipping pre-warp frames due to skewed corners: {skipped}")
+    return kept_frames
     return frames
 
 

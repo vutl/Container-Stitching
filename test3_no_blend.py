@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Stitch aligned images using the same incremental strategy as stitch_color_auto,
-but build the feature masks from saved 4-corner bounding boxes instead of color
-heuristics.
+Stitch aligned images using an incremental strategy and masks from saved
+4-corner bounding boxes. This variant avoids any Gaussian blur or
+multiband pyramid blending: overlap blending uses raw distance transforms
+only (no smoothing).
 """
 
 import argparse
@@ -154,7 +155,8 @@ def expand_canvas(mosaic: np.ndarray,
                   h_to_canvas: np.ndarray,
                   new_img: np.ndarray,
                   max_size: int = 14000,
-                  use_multiband: bool = True) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+                  use_multiband: bool = True,
+                  seam_trim: int = 0) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     h, w = new_img.shape[:2]
     corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
     warped_corners = cv2.perspectiveTransform(corners, h_to_canvas)
@@ -187,6 +189,26 @@ def expand_canvas(mosaic: np.ndarray,
     mask_src = np.ones((h, w), dtype=np.uint8) * 255
     warped_mask_new = cv2.warpPerspective(mask_src, h_final, (new_w, new_h), flags=cv2.INTER_NEAREST,
                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    # optionally trim seam by cropping 1..N columns from the left/right edges
+    if seam_trim and seam_trim > 0:
+        try:
+            ys, xs = np.where(warped_mask_new > 0)
+            if xs.size > 0:
+                x0 = int(xs.min())
+                x1 = int(xs.max())
+                trim = int(seam_trim)
+                # only trim if bbox is wider than 2*trim to avoid removing whole region
+                if (x1 - x0 + 1) > 2 * trim:
+                    # zero-out the left trim columns and right trim columns
+                    l0 = max(0, x0)
+                    l1 = min(warped_mask_new.shape[1], x0 + trim)
+                    r0 = max(0, x1 - trim)
+                    r1 = min(warped_mask_new.shape[1], x1)
+                    warped_mask_new[:, l0:l1] = 0
+                    warped_mask_new[:, r0:r1] = 0
+        except Exception:
+            # fallback: do nothing if any error
+            pass
     mask_new = warped_mask_new > 0
 
     mask_mosaic = np.ones((h_canvas, w_canvas), dtype=np.uint8) * 255
@@ -198,114 +220,11 @@ def expand_canvas(mosaic: np.ndarray,
     only_new = mask_new & (~mask_old)
     overlap = mask_new & mask_old
 
-    # if np.any(overlap):
-    #     base_pixels = moved[overlap].astype(np.float32)
-    #     new_pixels = warped_new[overlap].astype(np.float32)
-    #     mean_base = base_pixels.mean(axis=0)
-    #     mean_new = new_pixels.mean(axis=0)
-    #     std_base = base_pixels.std(axis=0)
-    #     std_new = new_pixels.std(axis=0)
-    #     scale = np.ones(3, dtype=np.float32)
-    #     valid = std_new > 1.0
-    #     scale[valid] = std_base[valid] / np.maximum(std_new[valid], 1e-3)
-    #     scale = np.clip(scale, 0.6, 1.6)
-    #     shift = mean_base - scale * mean_new
-    #     warped_new = np.clip(
-    #         warped_new.astype(np.float32) * scale[None, None, :] + shift[None, None, :],
-    #         0,
-    #         255,
-    #     ).astype(np.uint8)
-
     if np.any(only_new):
         out[only_new] = warped_new[only_new]
     if np.any(overlap):
-        mask_new_u8 = warped_mask_new.astype(np.uint8)
-        mask_old_u8 = moved_mask.astype(np.uint8)
-        dist_new = cv2.distanceTransform(mask_new_u8, cv2.DIST_L2, 5).astype(np.float32)
-        dist_old = cv2.distanceTransform(mask_old_u8, cv2.DIST_L2, 5).astype(np.float32)
-        dist_new = cv2.GaussianBlur(dist_new, (0, 0), sigmaX=6, sigmaY=6)
-        dist_old = cv2.GaussianBlur(dist_old, (0, 0), sigmaX=6, sigmaY=6)
-        denom = dist_new + dist_old + 1e-6
-        w_new = dist_new / denom
-        w_old = 1.0 - w_new
-
-        # If overlap region is large, use multiband pyramid blending to preserve high-frequency detail
-        overlap_count = int(overlap.sum())
-        MULTIBAND_THRESHOLD = 8000
-        if use_multiband and overlap_count >= MULTIBAND_THRESHOLD:
-            def _pyramid_blend(A, B, WA, WB, levels=5):
-                # A,B: uint8 images, WA/WB: float32 weight maps in [0,1], single or 3 channels
-                A_f = A.astype(np.float32)
-                B_f = B.astype(np.float32)
-                WA_f = WA.astype(np.float32)
-                WB_f = WB.astype(np.float32)
-
-                # build Gaussian pyramids for images and weights (level 0 = original)
-                GA = [A_f]
-                GB = [B_f]
-                GWA = [WA_f]
-                GWB = [WB_f]
-                for _ in range(levels - 1):
-                    GA.append(cv2.pyrDown(GA[-1]))
-                    GB.append(cv2.pyrDown(GB[-1]))
-                    GWA.append(cv2.pyrDown(GWA[-1]))
-                    GWB.append(cv2.pyrDown(GWB[-1]))
-
-                # build Laplacian pyramids for images
-                LA = []
-                LB = []
-                for i in range(levels - 1):
-                    size = (GA[i].shape[1], GA[i].shape[0])
-                    lap = GA[i] - cv2.pyrUp(GA[i+1], dstsize=size)
-                    LA.append(lap)
-                    lapb = GB[i] - cv2.pyrUp(GB[i+1], dstsize=size)
-                    LB.append(lapb)
-                LA.append(GA[-1])
-                LB.append(GB[-1])
-
-                # blend pyramids using corresponding weight maps at each level
-                LS = []
-                for i in range(levels):
-                    lA = LA[i]
-                    lB = LB[i]
-                    wA = GWA[i]
-                    wB = GWB[i]
-                    # resize weight maps if necessary to match lA
-                    if wA.shape[:2] != lA.shape[:2]:
-                        wA = cv2.resize(wA, (lA.shape[1], lA.shape[0]), interpolation=cv2.INTER_LINEAR)
-                    if wB.shape[:2] != lB.shape[:2]:
-                        wB = cv2.resize(wB, (lB.shape[1], lB.shape[0]), interpolation=cv2.INTER_LINEAR)
-                    # ensure weight map matches image channels
-                    if wA.ndim == 2:
-                        wA_c = np.repeat(wA[:, :, None], 3, axis=2)
-                        wB_c = np.repeat(wB[:, :, None], 3, axis=2)
-                    else:
-                        wA_c = wA; wB_c = wB
-                    denom = (wA_c + wB_c + 1e-6)
-                    wA_norm = wA_c / denom
-                    wB_norm = wB_c / denom
-                    LS.append(lA * wA_norm + lB * wB_norm)
-
-                # reconstruct
-                img_rec = LS[-1]
-                for lev in range(len(LS) - 2, -1, -1):
-                    size = (LS[lev].shape[1], LS[lev].shape[0])
-                    img_rec = cv2.pyrUp(img_rec, dstsize=size) + LS[lev]
-                return np.clip(img_rec, 0, 255).astype(np.uint8)
-
-            # prepare weight maps as float32 in [0,1]
-            Wn = w_new.astype(np.float32)
-            Wo = w_old.astype(np.float32)
-            if Wn.ndim == 2:
-                Wn3 = np.repeat(Wn[:, :, None], 3, axis=2)
-                Wo3 = np.repeat(Wo[:, :, None], 3, axis=2)
-            else:
-                Wn3 = Wn; Wo3 = Wo
-            blended = _pyramid_blend(moved.astype(np.uint8), warped_new.astype(np.uint8), Wo3, Wn3, levels=5)
-            out[overlap] = blended[overlap]
-        else:
-            blended = moved.astype(np.float32) * w_old[..., None] + warped_new.astype(np.float32) * w_new[..., None]
-            out[overlap] = np.clip(blended, 0, 255).astype(np.uint8)[overlap]
+        # Direct paste: new warped image overwrites overlap (no blending/smoothing)
+        out[overlap] = warped_new[overlap]
 
     # return moved/warped output, translation T, and boolean masks (old, new)
     return out, T, mask_old, mask_new
@@ -347,7 +266,8 @@ def stitch_incremental_with_corners(image_paths: List[Path],
                                     force_rect: bool = True,
                                     ecc_max_iter: int = 200,
                                     ecc_eps: float = 1e-4,
-                                    use_multiband: bool = True) -> Optional[Tuple[np.ndarray, np.ndarray, list]]:
+                                    use_multiband: bool = True,
+                                    seam_trim: int = 0) -> Optional[Tuple[np.ndarray, np.ndarray, list]]:
     if not image_paths:
         return None
     # normalize all input images to a common target height (median) to avoid
@@ -498,7 +418,7 @@ def stitch_incremental_with_corners(image_paths: List[Path],
         H[1, 2] = float(int(round(H[1, 2])))
 
         # Expand canvas and warp current frame into it
-        mosaic_new, T, mask_old, mask_new = expand_canvas(mosaic, H, cur_img, use_multiband=use_multiband)
+        mosaic_new, T, mask_old, mask_new = expand_canvas(mosaic, H, cur_img, use_multiband=use_multiband, seam_trim=seam_trim)
         if mosaic_new is None:
             print("  -> Canvas overflow; skipping frame")
             continue
@@ -535,6 +455,7 @@ def main():
     ap.add_argument('--corners-suffix', type=str, default='_aligned_corners.txt')
     ap.add_argument('--stride', type=int, default=2, help='Process every Nth frame (default: 2)')
     ap.add_argument('--mask-pad', type=int, default=0, help='Extra pixels added to bounding box masks')
+    ap.add_argument('--seam-trim', type=int, default=0, help='Horizontally trim new warped masks by N pixels to hide seams')
     ap.add_argument('--no-force-rect', action='store_true', help="Disable rectangle fill heuristic")
     ap.add_argument('--out', type=str, default='aligned', help='Output directory for panorama')
     ap.add_argument('--no-multiband', action='store_true', help='Disable multiband pyramid blending')
@@ -576,6 +497,7 @@ def main():
         mask_pad=max(0, args.mask_pad),
         force_rect=not args.no_force_rect,
         use_multiband=(not args.no_multiband),
+        seam_trim=max(0, args.seam_trim),
     )
     if res is None:
         print('Stitching failed.')
