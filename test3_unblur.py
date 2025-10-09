@@ -106,13 +106,74 @@ def edge_preserve_sharpen(img, amount=0.7):
     out = cv2.addWeighted(img, 1.0, detail, amount, 0)
     return np.clip(out, 0, 255).astype(np.uint8)
 
+def _gaussian_psf(ksize: int, sigma: float) -> np.ndarray:
+    # ksize nên là số lẻ ~ round(6*sigma)|1
+    ksize = max(3, int(round(6*sigma)) | 1)
+    ax = np.arange(-(ksize//2), ksize//2 + 1)
+    xx, yy = np.meshgrid(ax, ax)
+    psf = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
+    psf /= psf.sum()
+    return psf
+
+def wiener_deblur_gray(gray_u8: np.ndarray, sigma: float, K: float = 0.01) -> np.uint8:
+    # gray_u8: HxW uint8 [0..255]
+    g = gray_u8.astype(np.float32) / 255.0
+    h, w = g.shape
+    psf = _gaussian_psf(ksize=int(round(6*sigma))|1, sigma=sigma)
+
+    # pad PSF lên kích thước ảnh
+    psf_pad = np.zeros_like(g, dtype=np.float32)
+    kh, kw = psf.shape
+    psf_pad[:kh, :kw] = psf
+    # dịch PSF về tâm phổ (cùng convention với FFT)
+    psf_pad = np.roll(np.roll(psf_pad, -kh//2, axis=0), -kw//2, axis=1)
+
+    G = np.fft.fft2(g)
+    H = np.fft.fft2(psf_pad)
+    H_conj = np.conj(H)
+    denom = (np.abs(H)**2 + K)
+    F = (H_conj / denom) * G
+    f = np.fft.ifft2(F).real
+    out = np.clip(f * 255.0, 0, 255).astype(np.uint8)
+    return out
+
+def wiener_deblur_color(img_bgr_u8: np.ndarray, sigma: float, K: float = 0.01) -> np.ndarray:
+    # chạy trên Y (luma) để đỡ noise màu, rồi ghép lại
+    ycrcb = cv2.cvtColor(img_bgr_u8, cv2.COLOR_BGR2YCrCb)
+    Y, Cr, Cb = cv2.split(ycrcb)
+    Yd = wiener_deblur_gray(Y, sigma=sigma, K=K)
+    out = cv2.merge([Yd, Cr, Cb])
+    return cv2.cvtColor(out, cv2.COLOR_YCrCb2BGR)
+
+def richardson_lucy_gray(gray_u8: np.ndarray, sigma: float, iterations: int = 15, clip: bool = True) -> np.uint8:
+    g = gray_u8.astype(np.float32) / 255.0
+    psf = _gaussian_psf(ksize=int(round(6*sigma))|1, sigma=sigma)
+    estimate = g.copy()
+    psf_flipped = psf[::-1, ::-1]
+    eps = 1e-7
+    for _ in range(iterations):
+        conv_est = cv2.filter2D(estimate, -1, psf, borderType=cv2.BORDER_REPLICATE)
+        relative_blur = g / (conv_est + eps)
+        estimate = estimate * cv2.filter2D(relative_blur, -1, psf_flipped, borderType=cv2.BORDER_REPLICATE)
+        if clip:
+            estimate = np.clip(estimate, 0.0, 1.0)
+    return np.clip(estimate * 255.0, 0, 255).astype(np.uint8)
+
+def richardson_lucy_color(img_bgr_u8: np.ndarray, sigma: float, iterations: int = 15) -> np.ndarray:
+    ycrcb = cv2.cvtColor(img_bgr_u8, cv2.COLOR_BGR2YCrCb)
+    Y, Cr, Cb = cv2.split(ycrcb)
+    Yd = richardson_lucy_gray(Y, sigma=sigma, iterations=iterations)
+    out = cv2.merge([Yd, Cr, Cb])
+    return cv2.cvtColor(out, cv2.COLOR_YCrCb2BGR)
+
+
 
 def get_detector():
     if hasattr(cv2, 'SIFT_create'):
         return cv2.SIFT_create(), 'SIFT'
     if hasattr(cv2, 'xfeatures2d') and hasattr(cv2.xfeatures2d, 'SIFT_create'):
         return cv2.xfeatures2d.SIFT_create(), 'SIFT'
-    if hasattr(cv2, cv2, 'AKAZE_create'):
+    if hasattr(cv2, 'AKAZE_create'):
         return cv2.AKAZE_create(threshold=3e-4), 'AKAZE'
     return cv2.ORB_create(4000), 'ORB'
 
@@ -201,12 +262,12 @@ def expand_canvas(mosaic: np.ndarray,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
 
     mask_src = np.ones((h, w), dtype=np.uint8) * 255
-    warped_mask_new = cv2.warpPerspective(mask_src, h_final, (new_w, new_h), flags=cv2.INTER_LANCZOS4,
+    warped_mask_new = cv2.warpPerspective(mask_src, h_final, (new_w, new_h), flags=cv2.INTER_NEAREST,
                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     mask_new = warped_mask_new > 0
 
     mask_mosaic = np.ones((h_canvas, w_canvas), dtype=np.uint8) * 255
-    moved_mask = cv2.warpPerspective(mask_mosaic, T, (new_w, new_h), flags=cv2.INTER_LANCZOS4,
+    moved_mask = cv2.warpPerspective(mask_mosaic, T, (new_w, new_h), flags=cv2.INTER_NEAREST,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     mask_old = moved_mask > 0
 
@@ -252,7 +313,7 @@ def expand_canvas(mosaic: np.ndarray,
         overlap_count = int(overlap.sum())
         MULTIBAND_THRESHOLD = 8000
         if use_multiband and overlap_count >= MULTIBAND_THRESHOLD:
-            def _pyramid_blend(A, B, WA, WB, levels=4):
+            def _pyramid_blend(A, B, WA, WB, levels=3):
                 # A,B: uint8 images, WA/WB: float32 weight maps in [0,1], single or 3 channels
                 A_f = A.astype(np.float32)
                 B_f = B.astype(np.float32)
@@ -320,7 +381,7 @@ def expand_canvas(mosaic: np.ndarray,
                 Wo3 = np.repeat(Wo[:, :, None], 3, axis=2)
             else:
                 Wn3 = Wn; Wo3 = Wo
-            blended = _pyramid_blend(moved.astype(np.uint8), warped_new.astype(np.uint8), Wo3, Wn3, levels=5)
+            blended = _pyramid_blend(moved.astype(np.uint8), warped_new.astype(np.uint8), Wo3, Wn3)
             out[overlap] = blended[overlap]
         else:
             blended = moved.astype(np.float32) * w_old[..., None] + warped_new.astype(np.float32) * w_new[..., None]
@@ -366,7 +427,11 @@ def stitch_incremental_with_corners(image_paths: List[Path],
                                     force_rect: bool = True,
                                     ecc_max_iter: int = 200,
                                     ecc_eps: float = 1e-4,
-                                    use_multiband: bool = True) -> Optional[Tuple[np.ndarray, np.ndarray, list]]:
+                                    use_multiband: bool = True,
+                                    deblur_sigma: float = 0.0,
+                                    deblur_method: str = 'wiener',
+                                    wiener_K: float = 0.01,
+                                    rl_iters: int = 15) -> Optional[Tuple[np.ndarray, np.ndarray, list]]:
     if not image_paths:
         return None
     # normalize all input images to a common target height (median) to avoid
@@ -400,7 +465,15 @@ def stitch_incremental_with_corners(image_paths: List[Path],
     if base is None:
         raise FileNotFoundError(image_paths[0])
     
+    # Deblur trước khi unsharp (nếu bật)
+    if deblur_sigma > 0.0:
+        if deblur_method == 'wiener':
+            base = wiener_deblur_color(base, sigma=deblur_sigma, K=wiener_K)
+        else:
+            base = richardson_lucy_color(base, sigma=deblur_sigma, iterations=rl_iters)
+    # rồi mới unsharp nhẹ để tăng feature
     base = unsharp(base, radius=1.0, amount=1.1)
+
 
     # Initialize mosaic with first image
     mosaic = base.copy()
@@ -440,6 +513,11 @@ def stitch_incremental_with_corners(image_paths: List[Path],
             print("  -> Skip missing frame")
             continue
         cur_img = _normalize_height(cur_img, target_h)
+        if deblur_sigma > 0.0:
+            if deblur_method == 'wiener':
+                cur_img = wiener_deblur_color(cur_img, sigma=deblur_sigma, K=wiener_K)
+            else:
+                cur_img = richardson_lucy_color(cur_img, sigma=deblur_sigma, iterations=rl_iters)
         cur_img = unsharp(cur_img, radius=1.0, amount=1.1)
 
     # Get current frame mask: prefer precomputed mask PNG (<stem>_mask.png), else corners bbox
@@ -560,6 +638,11 @@ def main():
     ap.add_argument('--no-force-rect', action='store_true', help="Disable rectangle fill heuristic")
     ap.add_argument('--out', type=str, default='aligned', help='Output directory for panorama')
     ap.add_argument('--no-multiband', action='store_true', help='Disable multiband pyramid blending')
+    ap.add_argument('--deblur-sigma', type=float, default=0.0, help='Sigma Gaussian đã gây mờ (0 = tắt deblur)')
+    ap.add_argument('--deblur-method', type=str, default='wiener', choices=['wiener','rl'], help='Phương pháp deblur')
+    ap.add_argument('--wiener-K', type=float, default=0.01, help='Tham số K cho Wiener (0.005–0.02)')
+    ap.add_argument('--rl-iters', type=int, default=15, help='Số vòng lặp Richardson–Lucy (10–25)')
+
     args = ap.parse_args()
 
     aligned_dir = Path(args.aligned_dir)
@@ -598,7 +681,12 @@ def main():
         mask_pad=max(0, args.mask_pad),
         force_rect=not args.no_force_rect,
         use_multiband=(not args.no_multiband),
+        deblur_sigma=max(0.0, args.deblur_sigma),
+        deblur_method=args.deblur_method,
+        wiener_K=args.wiener_K,
+        rl_iters=max(1, args.rl_iters),
     )
+
     if res is None:
         print('Stitching failed.')
         return
