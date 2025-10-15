@@ -62,13 +62,28 @@ def run_pair(a_path: Path, b_path: Path, a_mask: Path = None, b_mask: Path = Non
     if mask_b is None:
         mask_b = np.ones(b_gray.shape, dtype=np.uint8)
 
-    # prefer SIFT; fall back to ORB
-    if hasattr(cv2, 'SIFT_create'):
-        det = cv2.SIFT_create()
-        norm = cv2.NORM_L2
+    # detector selection: prefer SIFT, fallback to ORB by default
+    # If caller set global var _FORCE_DET, respect it (see main())
+    det_choice = globals().get('_FORCE_DET', None)
+    if det_choice is None:
+        # original behaviour: use SIFT if available
+        if hasattr(cv2, 'SIFT_create'):
+            det = cv2.SIFT_create()
+            norm = cv2.NORM_L2
+        else:
+            det = cv2.ORB_create(4000)
+            norm = cv2.NORM_HAMMING
     else:
-        det = cv2.ORB_create(4000)
-        norm = cv2.NORM_HAMMING
+        choice = det_choice.lower()
+        if choice == 'sift' and hasattr(cv2, 'SIFT_create'):
+            det = cv2.SIFT_create(); norm = cv2.NORM_L2
+        elif choice == 'akaze' and hasattr(cv2, 'AKAZE_create'):
+            det = cv2.AKAZE_create(); norm = cv2.NORM_HAMMING
+        elif choice == 'kaze' and hasattr(cv2, 'KAZE_create'):
+            det = cv2.KAZE_create(); norm = cv2.NORM_L2
+        else:
+            # default to ORB
+            det = cv2.ORB_create(4000); norm = cv2.NORM_HAMMING
 
     kp1, des1 = det.detectAndCompute(a_gray, mask_a)
     kp2, des2 = det.detectAndCompute(b_gray, mask_b)
@@ -238,6 +253,8 @@ def main():
     ap.add_argument('--dir', default='aligned_cropped')
     ap.add_argument('--mask-suffix', default='_mask.png')
     ap.add_argument('--rectify', action='store_true', help='Use rectified directory (overrides --dir with aligned_rectified)')
+    ap.add_argument('--detector', default=None, choices=['sift', 'orb', 'akaze', 'kaze'],
+                    help='Force which feature detector to use (default: SIFT if available, else ORB)')
     ap.add_argument('--transform', default='translation', choices=['translation', 'affine', 'homography'],
                     help='Transform model used for quick stitch preview')
     args = ap.parse_args()
@@ -261,6 +278,9 @@ def main():
             a_mask_path = None
         if not b_mask_path.exists():
             b_mask_path = None
+    # export detector choice as a global so run_pair can pick it up (small, safe hack)
+    if args.detector:
+        globals()['_FORCE_DET'] = args.detector
     run_pair(a_path, b_path, a_mask=a_mask_path, b_mask=b_mask_path, transform=args.transform)
 
 

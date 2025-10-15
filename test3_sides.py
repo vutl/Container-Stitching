@@ -95,6 +95,20 @@ def rect_fill_if_close(mask: np.ndarray, min_fill_ratio: float = 0.72) -> np.nda
 
 
 def get_detector():
+    # Allow forcing a detector via global _FORCE_DET set by main()
+    forced = globals().get('_FORCE_DET', None)
+    if forced is not None:
+        f = str(forced).lower()
+        if f == 'sift' and hasattr(cv2, 'SIFT_create'):
+            return cv2.SIFT_create(), 'SIFT'
+        if f == 'akaze' and hasattr(cv2, 'AKAZE_create'):
+            return cv2.AKAZE_create(), 'AKAZE'
+        if f == 'kaze' and hasattr(cv2, 'KAZE_create'):
+            return cv2.KAZE_create(), 'KAZE'
+        if f == 'orb':
+            return cv2.ORB_create(4000), 'ORB'
+
+    # Default behaviour: prefer SIFT if available, else ORB
     if hasattr(cv2, 'SIFT_create'):
         return cv2.SIFT_create(), 'SIFT'
     if hasattr(cv2, 'xfeatures2d') and hasattr(cv2.xfeatures2d, 'SIFT_create'):
@@ -115,7 +129,8 @@ def estimate_transform_affine_masked(src: np.ndarray,
     if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
         return None
 
-    norm = cv2.NORM_L2 if det_name == 'SIFT' else cv2.NORM_HAMMING
+    # Use L2 for float descriptors (SIFT, KAZE), Hamming for binary (ORB, AKAZE)
+    norm = cv2.NORM_L2 if det_name in ('SIFT', 'KAZE') else cv2.NORM_HAMMING
     bf = cv2.BFMatcher(norm, crossCheck=False)
     pairs = bf.knnMatch(des1, des2, 2)
     good = []
@@ -153,7 +168,8 @@ def estimate_transform_homography_masked(src: np.ndarray,
     kp2, des2 = det.detectAndCompute(gray2, mt)
     if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
         return None
-    norm = cv2.NORM_L2 if det_name == 'SIFT' else cv2.NORM_HAMMING
+    # Use L2 for float descriptors (SIFT, KAZE), Hamming for binary (ORB, AKAZE)
+    norm = cv2.NORM_L2 if det_name in ('SIFT', 'KAZE') else cv2.NORM_HAMMING
     bf = cv2.BFMatcher(norm, crossCheck=False)
     pairs = bf.knnMatch(des1, des2, 2)
     good = []
@@ -188,7 +204,8 @@ def estimate_translation_masked(src: np.ndarray,
     if des1 is None or des2 is None or len(kp1) < 3 or len(kp2) < 3:
         return None
 
-    norm = cv2.NORM_L2 if det_name == 'SIFT' else cv2.NORM_HAMMING
+    # Use L2 for float descriptors (SIFT, KAZE), Hamming for binary (ORB, AKAZE)
+    norm = cv2.NORM_L2 if det_name in ('SIFT', 'KAZE') else cv2.NORM_HAMMING
     bf = cv2.BFMatcher(norm, crossCheck=False)
     raw = bf.knnMatch(des1, des2, 2)
     good = []
@@ -585,6 +602,8 @@ def main():
                     help='Blend mode in overlaps: feather (default), seam (min-error cut), or none (hard cut)')
     ap.add_argument('--lock-dy', action='store_true', help='Force vertical translation to zero to avoid vertical drift')
     ap.add_argument('--seam-width', type=int, default=1, help='Soft seam width in pixels (horizontal blur)')
+    ap.add_argument('--detector', type=str, default=None, choices=['sift', 'orb', 'akaze', 'kaze'],
+                    help='Force which feature detector to use during matching')
     args = ap.parse_args()
 
     aligned_dir = Path(args.aligned_dir)
@@ -615,6 +634,10 @@ def main():
         if not c.exists():
             print(f"Missing corners: {c}")
             return
+
+    # Respect detector override if provided
+    if args.detector:
+        globals()['_FORCE_DET'] = args.detector
 
     mosaic = stitch_incremental_with_corners(
         image_paths,
