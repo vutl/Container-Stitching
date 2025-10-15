@@ -2,20 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-Container corner completion - ONLY the 3-corner case.
-- Detect corners with YOLO.
-- Keep top-1 per quadrant (TL/TR/BR/BL).
-- If and only if we have exactly 3 corners, infer the 4th corner purely by
-  vector arithmetic on the box centers (no mirroring, no container bounds),
-  then create a box for it using neighbor sizes.
-- If not 3 detections, we just save the detections and warn.
-
-Quadrants (image coordinates): A=TL, B=TR, C=BR, D=BL (clockwise).
-Vector completion:
-  missing A: A = B + D - C
-  missing B: B = A + C - D
-  missing C: C = B + D - A
-  missing D: D = A + C - B
+Same as test.py but use YOLO class names to decide head vs regular corners.
+- If a detection's class name is 'edge_cor' we treat it as container-head corner
+  (use the head-offset rule to place the corner).
+- If class name is 'gu_cor' we treat it as a regular corner and run the
+  gradient-based refinement.
 """
 
 import argparse
@@ -24,10 +15,11 @@ import cv2
 import numpy as np
 
 from corner_completion import box_center, assign_quadrant, VectorCornerCompleter
-from corner_refinement import CornerRefinerParams, refine_corners
+from corner_refinement_sides import CornerRefinerParams, refine_corners, CornerCandidate
+
 
 # ---------- drawing ----------
-def draw_boxes(img, boxes, labels, scores=None):
+def draw_boxes(img, boxes, classes, scores=None):
     out = img.copy()
     color = {
         "det":    (0,255,0),      # green
@@ -35,7 +27,8 @@ def draw_boxes(img, boxes, labels, scores=None):
     }
     for i, b in enumerate(boxes):
         x1, y1, x2, y2 = [int(round(v)) for v in b]
-        lab = labels[i]
+        cls = classes[i] if classes is not None and i < len(classes) else 'det'
+        lab = 'det' if cls is None else cls
         col = color.get(lab, (0,255,0))
         cv2.rectangle(out, (x1,y1), (x2,y2), col, 2)
         txt = lab if scores is None or scores[i] is None else f"{lab} {scores[i]:.2f}"
@@ -44,7 +37,8 @@ def draw_boxes(img, boxes, labels, scores=None):
         cv2.putText(out, txt, (x1+2, y1-4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
     return out
 
-# ---------- YOLO ----------
+
+# ---------- YOLO (get classes) ----------
 def load_model(model_path):
     try:
         from ultralytics import YOLO
@@ -53,35 +47,51 @@ def load_model(model_path):
         print("Ultralytics not available:", e)
         raise
 
+
 def run_detect(model, img, conf, iou):
     res = model.predict(img, conf=conf, iou=iou, verbose=False)
     r = res[0] if isinstance(res, (list,tuple)) else res
-    boxes, scores = [], []
+    boxes, scores, classes = [], [], []
     try:
         b = r.boxes.xyxy.cpu().numpy()
         s = r.boxes.conf.cpu().numpy()
-        for bb, sc in zip(b, s):
+        cls = r.boxes.cls.cpu().numpy()
+        names = None
+        try:
+            names = model.model.names
+        except Exception:
+            try:
+                names = model.names
+            except Exception:
+                names = None
+        for bb, sc, cc in zip(b, s, cls):
             boxes.append(bb.tolist())
             scores.append(float(sc))
+            if names is None:
+                classes.append(str(int(cc)))
+            else:
+                classes.append(str(names.get(int(cc), str(int(cc)))))
     except Exception:
         pass
-    return boxes, scores
+    return boxes, scores, classes
 
-def keep_best_per_quadrant(boxes, scores, w, h, max_per_quad=1):
+
+def keep_best_per_quadrant(boxes, scores, classes, w, h, max_per_quad=1):
     quads = {"TL":[], "TR":[], "BR":[], "BL":[]}
-    for b, s in zip(boxes, scores):
+    for b, s, c in zip(boxes, scores, classes):
         cx, cy = box_center(b)
         q = assign_quadrant(cx, cy, w, h)
-        quads[q].append((b, s))
-    kept_boxes, kept_scores = [], []
+        quads[q].append((b, s, c))
+    kept_boxes, kept_scores, kept_classes = [], [], []
     for q in quads:
         quads[q].sort(key=lambda x: x[1], reverse=True)
-        for b,s in quads[q][:max_per_quad]:
-            kept_boxes.append(b); kept_scores.append(s)
-    return kept_boxes, kept_scores
+        for item in quads[q][:max_per_quad]:
+            b, s, c = item
+            kept_boxes.append(b); kept_scores.append(s); kept_classes.append(c)
+    return kept_boxes, kept_scores, kept_classes
 
 
-# ---------- main ----------
+# ---------- main (sides-aware) ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model', type=str, default='last11scor_3class_31_07.pt')
@@ -89,8 +99,8 @@ def main():
     ap.add_argument('--indices', type=str, nargs='+', required=True,
                     help="numbers or ranges like 54 60-65")
     ap.add_argument('--suffix', type=str, default='_cropped_padded.jpg')
-    ap.add_argument('--out', type=str, required=True, default='out_annot')
-    ap.add_argument('--conf', type=float, default=0.5)
+    ap.add_argument('--out', type=str, required=True, default='out_annot_sides')
+    ap.add_argument('--conf', type=float, default=0.05)
     ap.add_argument('--iou', type=float, default=0.6)
     ap.add_argument('--max-per-quad', type=int, default=1)
     ap.add_argument('--debug', action='store_true')
@@ -115,7 +125,7 @@ def main():
     ap.add_argument('--corner-min-accept-score', type=float, default=10.0)
     ap.add_argument('--corner-head-area-thresh', type=float, default=2000.0,
                     help='Area threshold to treat a bbox as container head')
-    ap.add_argument('--corner-head-offset', type=int, default=10,
+    ap.add_argument('--corner-head-offset', type=int, default=20,
                     help='Offset (px) applied when extending container head corners')
     args = ap.parse_args()
 
@@ -164,23 +174,24 @@ def main():
             print(f"Read fail: {p}"); continue
         h, w = img.shape[:2]
 
-        # 1) detect
-        boxes, scores = run_detect(model, img, conf=args.conf, iou=args.iou)
-        boxes, scores = keep_best_per_quadrant(boxes, scores, w, h, args.max_per_quad)
-        labels = ["det"] * len(boxes)
+        # 1) detect (get classes)
+        boxes, scores, classes = run_detect(model, img, conf=args.conf, iou=args.iou)
+        boxes, scores, classes = keep_best_per_quadrant(boxes, scores, classes, w, h, args.max_per_quad)
+        labels = [c if c is not None else 'det' for c in classes]
 
-        # 2) only handle 3-corner case
+        # 2) only handle 3-corner case (vector completion remains class-agnostic)
         if len(boxes) == 3:
             completion = VectorCornerCompleter.infer_missing_three(boxes, (w, h))
             if completion is not None:
                 boxes.append(completion.box)
                 scores.append(None)
-                labels.append("pred_3")
+                classes.append('gu_cor')
+                labels.append('pred_3')
         else:
             print(f"[{i}] detections = {len(boxes)} (skip vector-complete; need exactly 3)")
 
-        # 3) save
-        annotated = draw_boxes(img, boxes, labels, scores)
+        # 3) save annotated boxes (show class names)
+        annotated = draw_boxes(img, boxes, classes, scores)
         out_img = out_dir / f"{i}_annot{args.suffix}"
         cv2.imwrite(str(out_img), annotated)
         safe_suffix = args.suffix.replace('.', '_')
@@ -199,7 +210,12 @@ def main():
         if args.no_corners:
             continue
 
-        corner_candidates = refine_corners(img, boxes_int, corner_params)
+        # 4) refine corners for all boxes. For side-face images we pass a per-box
+        # `force_head` list derived from detector class names so head-style
+        # corners are returned when the detector already indicates a head.
+        force_head = [(c == 'gu_cor') for c in classes]
+        corner_candidates = refine_corners(img, boxes_int, corner_params, force_head=force_head)
+
         corner_txt = out_dir / f"{i}_corners.txt"
         with open(corner_txt, "w") as f:
             for cand, b_int in zip(corner_candidates, boxes_int):
@@ -219,6 +235,7 @@ def main():
         cv2.imwrite(str(corner_img), corners_vis)
         print(f"Wrote corners: {corner_txt} and annotated image: {corner_img}")
     print("Done.")
+
 
 if __name__ == "__main__":
     main()
