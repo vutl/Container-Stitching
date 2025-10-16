@@ -3,10 +3,10 @@
 
 """
 Same as test.py but use YOLO class names to decide head vs regular corners.
-- If a detection's class name is 'edge_cor' we treat it as container-head corner
-  (use the head-offset rule to place the corner).
-- If class name is 'gu_cor' we treat it as a regular corner and run the
-  gradient-based refinement.
+- If a detection's class name is 'gu_cor' we treat it as container-head corner
+    (use the head-offset rule to place the corner).
+- If class name is 'edge_cor' we treat it as a regular corner and run the
+    gradient-based refinement.
 """
 
 import argparse
