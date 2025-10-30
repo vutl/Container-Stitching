@@ -71,6 +71,7 @@ def _pick_size_for_missing(wh_by_quad: Dict[Quadrant, Tuple[float, float]],
 class CornerCompletionResult:
     quadrant: Quadrant
     box: List[int]
+    inferred_class: Optional[str] = None  # 'gu_cor' or 'edge_cor' inferred from same-column corner
 
 
 class VectorCornerCompleter:
@@ -86,12 +87,14 @@ class VectorCornerCompleter:
     @classmethod
     def infer_missing_three(cls,
                             boxes: List[Box],
-                            image_size: Tuple[int, int]) -> Optional[CornerCompletionResult]:
+                            image_size: Tuple[int, int],
+                            classes: Optional[List[str]] = None) -> Optional[CornerCompletionResult]:
         """Infer the missing corner when exactly three quadrants are detected.
 
         Args:
             boxes: list of three bounding boxes [x1, y1, x2, y2].
             image_size: (width, height) of the image.
+            classes: optional list of class names ('gu_cor' or 'edge_cor') for each box.
 
         Returns:
             CornerCompletionResult if a missing corner can be inferred, otherwise None.
@@ -113,6 +116,11 @@ class VectorCornerCompleter:
         quads = [assign_quadrant(cx, cy, width, height) for cx, cy in centers]
         quad_to_center = {q: c for q, c in zip(quads, centers)}
         quad_to_wh = {q: (abs(b[2] - b[0]), abs(b[3] - b[1])) for q, b in zip(quads, boxes)}
+        
+        # Map quadrant to class if provided
+        quad_to_class = {}
+        if classes is not None and len(classes) == len(quads):
+            quad_to_class = {q: c for q, c in zip(quads, classes)}
 
         missing = list({"TL", "TR", "BR", "BL"} - set(quads))
         if not missing:
@@ -133,7 +141,21 @@ class VectorCornerCompleter:
 
         bw, bh = _pick_size_for_missing(quad_to_wh, missing_q, fallback_w, fallback_h)
         box = _make_box_from_center(cx, cy, bw, bh, width, height)
-        return CornerCompletionResult(quadrant=missing_q, box=box)
+        
+        # Infer class from same-column corner:
+        # TL/BL are left column, TR/BR are right column
+        inferred_class = None
+        if quad_to_class:
+            if missing_q == "TL" and "BL" in quad_to_class:
+                inferred_class = quad_to_class["BL"]  # same left column
+            elif missing_q == "TR" and "BR" in quad_to_class:
+                inferred_class = quad_to_class["BR"]  # same right column
+            elif missing_q == "BR" and "TR" in quad_to_class:
+                inferred_class = quad_to_class["TR"]  # same right column
+            elif missing_q == "BL" and "TL" in quad_to_class:
+                inferred_class = quad_to_class["TL"]  # same left column
+        
+        return CornerCompletionResult(quadrant=missing_q, box=box, inferred_class=inferred_class)
 
 
 __all__ = [

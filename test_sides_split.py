@@ -29,6 +29,7 @@ This is a validation tool per your spec; it does not alter other scripts.
 import argparse
 from pathlib import Path
 from typing import List, Tuple, Optional
+import re
 import cv2
 import numpy as np
 
@@ -386,15 +387,31 @@ def main():
                 idxs.append(int(s))
         files = [Path(args.dir) / f"{i}{args.suffix}" for i in idxs]
     else:
-        files = sorted(Path(args.dir).glob(f"*{args.suffix}"))
+        # glob all matching files but skip stitched composites (stitch_img_* or stitch_*)
+        all_files = list(Path(args.dir).glob(f"*{args.suffix}"))
+        files = []
+        for p in all_files:
+            name = p.name
+            # skip typical stitched/composite filenames
+            if name.startswith('stitch_img_') or name.startswith('stitch_'):
+                continue
+            files.append(p)
         # try to derive numeric order when possible
         def _key(p: Path):
+            # Try to extract trailing integer index from filename stem (e.g. 'img_12' -> 12)
             stem = p.name[:-len(args.suffix)] if p.name.endswith(args.suffix) else p.stem
-            try:
-                return (0, int(stem))
-            except Exception:
-                return (1, stem)
+            m = re.search(r"(\d+)$", stem)
+            if m:
+                try:
+                    return (0, int(m.group(1)))
+                except Exception:
+                    pass
+            # Fallback: non-numeric stems sort after numeric ones and use lexical order
+            return (1, stem)
         files.sort(key=_key)
+        # Skip stitched composite images (they often are named stitch_img_*) so
+        # the detector doesn't process previously-created panoramas.
+        files = [p for p in files if not p.name.startswith('stitch_img_')]
 
     corner_params = None
     if not args.no_corners:
@@ -419,7 +436,9 @@ def main():
 
     seam_found: bool = False
 
-    for p in files:
+    total_files = len(files)
+
+    for pos, p in enumerate(files):
         # derive printable index label
         stem = p.name[:-len(args.suffix)] if p.name.endswith(args.suffix) else p.stem
         idx_label = stem
@@ -435,7 +454,13 @@ def main():
         # Decide which folder
         if not seam_found:
             # test seam condition
-            trigger = (len(boxes) > 4) or _gu_same_row_too_close(boxes, classes, w, h)
+            # NOTE: Ignore seam triggers for the first 6 and last 6 frames of the
+            # sequence as requested (these boundary frames should not cause a
+            # split even if they contain >4 boxes or many gu_cor detections).
+            if pos < 6 or pos >= (total_files - 6):
+                trigger = False
+            else:
+                trigger = (len(boxes) > 4) or _gu_same_row_too_close(boxes, classes, w, h)
             if trigger:
                 seam_found = True
                 # estimate seam x from gu_cor pairs to split accurately

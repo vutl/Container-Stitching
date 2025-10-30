@@ -300,7 +300,10 @@ def expand_canvas(mosaic: np.ndarray,
                   new_img: np.ndarray,
                   max_size: int = 14000,
                   blend_mode: str = 'feather',
-                  seam_width: int = 1) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+                  seam_width: int = 1,
+                  debug_save: bool = False,
+                  debug_dir: Optional[Path] = None,
+                  step_name: Optional[str] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     h, w = new_img.shape[:2]
     corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
     warped_corners = cv2.perspectiveTransform(corners, h_to_canvas)
@@ -362,6 +365,7 @@ def expand_canvas(mosaic: np.ndarray,
 
     if np.any(only_new):
         out[only_new] = warped_new[only_new]
+    seam_mask_full = None
     if np.any(overlap):
         if blend_mode == 'none':
             # Hard cut: prefer new where overlap
@@ -381,6 +385,10 @@ def expand_canvas(mosaic: np.ndarray,
                 blend_mode_local = 'seam'
             if blend_mode_local == 'seam':
                 seam_mask = _vertical_min_error_seam(subA, subB).astype(np.uint8)
+                # build full-size seam mask for debugging (placed at bbox)
+                if debug_save and debug_dir is not None:
+                    seam_mask_full = np.zeros((new_h, new_w), dtype=np.uint8)
+                    seam_mask_full[y0:y1, x0:x1] = (seam_mask * 255).astype(np.uint8)
                 # Keep only inside overlap
                 seam_mask = (seam_mask & mask_sub.astype(np.uint8))
                 # Create float mask and optionally smooth horizontally to avoid abrupt breaks
@@ -391,8 +399,8 @@ def expand_canvas(mosaic: np.ndarray,
                     sw = int(max(1, seam_width))
                 if sw > 1:
                     kx = sw * 2 + 1
-                    # Blur across x axis to create a transition band
-                    fmask = cv2.GaussianBlur(fmask, (kx, 1), sigmaX=sw)
+                    # Minimal horizontal blur to soften hard seam edge
+                    fmask = cv2.GaussianBlur(fmask, (kx, 1), sigmaX=sw * 0.5)
                     # Normalize to [0,1]
                     maxv = float(fmask.max()) if fmask.max() > 0 else 1.0
                     fmask = fmask / maxv
@@ -439,7 +447,26 @@ def expand_canvas(mosaic: np.ndarray,
             blended = moved.astype(np.float32) * w_old[..., None] + warped_new.astype(np.float32) * w_new[..., None]
             out[overlap] = np.clip(blended, 0, 255).astype(np.uint8)[overlap]
 
-    return out, T
+    # If requested, write debug files: moved (mosaic before), warped_new (new warped), seam mask
+    if debug_save and debug_dir is not None:
+        try:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            if step_name is None:
+                step_name = 'step'
+            # Save moved (mosaic after warp of previous canvas but before blend)
+            mv_path = debug_dir / f"{step_name}_moved.png"
+            cv2.imwrite(str(mv_path), moved)
+            # Save warped new image
+            wn_path = debug_dir / f"{step_name}_warped_new.png"
+            cv2.imwrite(str(wn_path), warped_new)
+            # Save seam mask if computed
+            if seam_mask_full is not None:
+                sm_path = debug_dir / f"{step_name}_seam_mask.png"
+                cv2.imwrite(str(sm_path), seam_mask_full)
+        except Exception:
+            pass
+
+    return out, T, seam_mask_full
 
 
 def crop_final_mosaic(mosaic: np.ndarray) -> np.ndarray:
@@ -466,7 +493,9 @@ def stitch_incremental_with_corners(image_paths: List[Path],
                                     transform: str = 'translation',
                                     blend: str = 'feather',
                                     lock_dy: bool = False,
-                                    seam_width: int = 1) -> Optional[np.ndarray]:
+                                    seam_width: int = 1,
+                                    debug_save: bool = False,
+                                    debug_dir: Optional[Path] = None) -> Optional[np.ndarray]:
     if not image_paths:
         return None
     base = cv2.imread(str(image_paths[0]))
@@ -563,6 +592,10 @@ def stitch_incremental_with_corners(image_paths: List[Path],
             H[0, 0] = 1.0; H[0, 1] = 0.0
             H[1, 0] = 0.0; H[1, 1] = 1.0
 
+        if not is_reasonable_transform(H):
+            print("  -> Transform seems unreasonable; skipping")
+            continue
+
         # Optionally lock vertical translation to zero (prevent vertical drift)
         if lock_dy:
             try:
@@ -571,13 +604,23 @@ def stitch_incremental_with_corners(image_paths: List[Path],
                 pass
 
         # Expand canvas and warp current frame into it
-        mosaic_new, T = expand_canvas(mosaic, H, cur_img, blend_mode=blend, seam_width=seam_width)
+        step_name = f"{k}_{cur_path.stem}"
+        mosaic_new, T, seam_mask = expand_canvas(
+            mosaic, H, cur_img, blend_mode=blend, seam_width=seam_width,
+            debug_save=debug_save, debug_dir=debug_dir, step_name=step_name)
         if mosaic_new is None:
             print("  -> Canvas overflow; skipping frame")
             continue
 
         mosaic = mosaic_new
         print(f"  -> Stitched; canvas {mosaic.shape[1]}x{mosaic.shape[0]}")
+        if debug_save and debug_dir is not None:
+            try:
+                # save a copy of the mosaic after this step
+                fname = debug_dir / f"{step_name}_mosaic.png"
+                cv2.imwrite(str(fname), mosaic)
+            except Exception:
+                pass
 
     return mosaic
 
@@ -604,6 +647,10 @@ def main():
     ap.add_argument('--seam-width', type=int, default=1, help='Soft seam width in pixels (horizontal blur)')
     ap.add_argument('--detector', type=str, default=None, choices=['sift', 'orb', 'akaze', 'kaze'],
                     help='Force which feature detector to use during matching')
+    ap.add_argument('--reverse', action='store_true',
+                    help='Process frames in descending index order (right-to-left stitching)')
+    ap.add_argument('--debug-steps', action='store_true', help='Save per-step debug images (moved/warped/seam/mosaic)')
+    ap.add_argument('--debug-dir', type=str, default=None, help='Directory to save debug-step images')
     args = ap.parse_args()
 
     aligned_dir = Path(args.aligned_dir)
@@ -622,6 +669,9 @@ def main():
         ordered = [args.ref_index] + [i for i in idxs if i != args.ref_index]
     else:
         ordered = sorted(idxs)
+
+    if args.reverse:
+        ordered = list(reversed(ordered))
 
     image_paths = [aligned_dir / f"{i}_aligned.jpg" for i in ordered]
     corner_paths = [corners_dir / f"{i}{args.corners_suffix}" for i in ordered]
@@ -649,6 +699,8 @@ def main():
         blend=args.blend,
         lock_dy=args.lock_dy,
         seam_width=max(0, int(args.seam_width)),
+        debug_save=args.debug_steps,
+        debug_dir=Path(args.debug_dir) if args.debug_dir else None,
     )
     if mosaic is None:
         print('Stitching failed.')

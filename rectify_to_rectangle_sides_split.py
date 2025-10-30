@@ -18,8 +18,8 @@ def main():
     ap.add_argument('--out1', default='aligned_rectified_sides_1')
 
     # Segment 2
-    ap.add_argument('--dir2', required=True, help='Aligned input dir for segment 2')
-    ap.add_argument('--indices2', required=True)
+    ap.add_argument('--dir2', required=False, help='Aligned input dir for segment 2 (optional)')
+    ap.add_argument('--indices2', required=False)
     ap.add_argument('--out2', default='aligned_rectified_sides_2')
 
     # Common knobs
@@ -41,13 +41,20 @@ def main():
         cmd1.append('--write-mask')
     subprocess.run(cmd1, check=True)
 
-    cmd2 = [sys.executable, script,
-            '--dir', args.dir2,
-            '--indices', args.indices2,
-            '--out', args.out2,
-            '--image-suffix', args.image_suffix,
-            '--corners-suffix', args.corners_suffix,
-            '--vertical-margin', str(args.vertical_margin)]
-    if args.write_mask:
-        cmd2.append('--write-mask')
-    subprocess.run(cmd2, check=True)
+    if args.dir2 and args.indices2:
+        cmd2 = [sys.executable, script,
+                '--dir', args.dir2,
+                '--indices', args.indices2,
+                '--out', args.out2,
+                '--image-suffix', args.image_suffix,
+                '--corners-suffix', args.corners_suffix,
+                '--vertical-margin', str(args.vertical_margin)]
+        if args.write_mask:
+            cmd2.append('--write-mask')
+        subprocess.run(cmd2, check=True)
+    else:
+        print('Segment 2 skipped: single-container mode.')
+
+
+if __name__ == '__main__':
+    main()

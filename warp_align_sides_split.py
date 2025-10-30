@@ -24,8 +24,8 @@ def main():
     ap.add_argument('--out1', default='aligned_sides_1')
 
     # Segment 2
-    ap.add_argument('--dir2', required=True, help='Trimmed images directory for segment 2')
-    ap.add_argument('--indices2', required=True, help='Indices for segment 2 (e.g., 20-58)')
+    ap.add_argument('--dir2', required=False, help='Trimmed images directory for segment 2 (optional)')
+    ap.add_argument('--indices2', required=False, help='Indices for segment 2 (optional, e.g., 20-58)')
     ap.add_argument('--img-suffix2', default='_no_warp_trim.jpg')
     ap.add_argument('--corners-dir2', default='out_trimmed_sides_corners_2')
     ap.add_argument('--corners-suffix2', default='_corners.txt')
@@ -52,18 +52,21 @@ def main():
     subprocess.run(cmd1, check=True)
 
     # Run segment 2
-    cmd2 = [sys.executable, script,
-            '--dir', args.dir2,
-            '--indices', args.indices2,
-            '--img-suffix', args.img_suffix2,
-            '--corners-dir', args.corners_dir2,
-            '--corners-suffix', args.corners_suffix2,
-            '--out', args.out2,
-            '--top', str(args.top),
-            '--bottom', str(args.bottom)]
-    if args.center_container:
-        cmd2.append('--center-container')
-    subprocess.run(cmd2, check=True)
+    if args.dir2 and args.indices2:
+        cmd2 = [sys.executable, script,
+                '--dir', args.dir2,
+                '--indices', args.indices2,
+                '--img-suffix', args.img_suffix2,
+                '--corners-dir', args.corners_dir2,
+                '--corners-suffix', args.corners_suffix2,
+                '--out', args.out2,
+                '--top', str(args.top),
+                '--bottom', str(args.bottom)]
+        if args.center_container:
+            cmd2.append('--center-container')
+        subprocess.run(cmd2, check=True)
+    else:
+        print('Segment 2 skipped: single-container mode.')
 
 
 if __name__ == '__main__':
