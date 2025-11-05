@@ -27,6 +27,7 @@ This is a validation tool per your spec; it does not alter other scripts.
 """
 
 import argparse
+from collections import deque
 from pathlib import Path
 from typing import List, Tuple, Optional
 import re
@@ -181,6 +182,89 @@ def _gu_same_row_too_close(boxes, classes, w, h, min_dx_frac=0.12):
     return min_dx < (min_dx_frac * w)
 
 
+def _validate_bottom_alignment(corners_dict, max_align_diff_px=40):
+    """Check if BL and BR corners are horizontally aligned (same row).
+    
+    Returns:
+        - 'valid': both corners aligned within threshold
+        - 'remove_BL': BL corner should be removed (y too far from BR)
+        - 'remove_BR': BR corner should be removed (y too far from BL)
+    """
+    if 'BL' not in corners_dict or 'BR' not in corners_dict:
+        return 'valid'  # can't validate if corners missing
+    
+    bl_x, bl_y = corners_dict['BL']
+    br_x, br_y = corners_dict['BR']
+    
+    diff_y = abs(bl_y - br_y)
+    if diff_y <= max_align_diff_px:
+        return 'valid'
+    
+    # Determine which corner is more deviated
+    # Use TL/TR as reference if available to decide which bottom corner is wrong
+    if 'TL' in corners_dict and 'TR' in corners_dict:
+        tl_y = corners_dict['TL'][1]
+        tr_y = corners_dict['TR'][1]
+        h_left = abs(bl_y - tl_y)
+        h_right = abs(br_y - tr_y)
+        
+        # The column with more extreme height deviation is likely wrong
+        # But we also check: if one bottom corner is much lower than the other, remove the lower one
+        if bl_y > br_y:
+            # BL is lower than BR
+            return 'remove_BL'
+        else:
+            # BR is lower than BL
+            return 'remove_BR'
+    else:
+        # Fallback: remove the corner that's further down (higher y value)
+        if bl_y > br_y:
+            return 'remove_BL'
+        else:
+            return 'remove_BR'
+
+
+def _validate_vertical_alignment(corners_dict, max_align_diff_px=80):
+    """Check if corners in the same column are vertically aligned (same x).
+    
+    Validates:
+    - Left column: TL.x vs BL.x
+    - Right column: TR.x vs BR.x
+    
+    Returns list of corners to remove (e.g., ['TL', 'BR'])
+    """
+    to_remove = []
+    
+    # Check left column (TL vs BL)
+    if 'TL' in corners_dict and 'BL' in corners_dict:
+        tl_x, tl_y = corners_dict['TL']
+        bl_x, bl_y = corners_dict['BL']
+        diff_x = abs(tl_x - bl_x)
+        if diff_x > max_align_diff_px:
+            # Remove the corner with lower confidence or the one further from expected position
+            # For now, remove the one with larger x deviation from the smaller x value
+            # (assuming left edge should be closer to x=0)
+            if tl_x > bl_x:
+                to_remove.append('TL')
+            else:
+                to_remove.append('BL')
+    
+    # Check right column (TR vs BR)
+    if 'TR' in corners_dict and 'BR' in corners_dict:
+        tr_x, tr_y = corners_dict['TR']
+        br_x, br_y = corners_dict['BR']
+        diff_x = abs(tr_x - br_x)
+        if diff_x > max_align_diff_px:
+            # Remove the corner further from expected position
+            # (assuming right edge should be closer to image width)
+            if tr_x < br_x:
+                to_remove.append('TR')
+            else:
+                to_remove.append('BR')
+    
+    return to_remove
+
+
 def _select_by_side(boxes, scores, classes, w, h, side: str, x_split: Optional[float]=None):
     """Return boxes on left (side='L') or right (side='R') of seam_x.
     side is handled by caller; this helper only filters by x relative to x_mid.
@@ -207,6 +291,10 @@ def _keep_two_gu_two_edge(boxes, scores, classes, w, h, side: str, x_split: Opti
         cx, cy = box_center(b)
         is_top = cy < h*0.5
         if c == 'gu_cor':
+            # ignore very weak gu detections so edge_cor is preferred
+            if s is None or s < globals().get('MIN_GU_CONF', 0.0):
+                # treat as non-gu (skip adding to gu lists)
+                continue
             (top_gu if is_top else bot_gu).append((b,s,c))
         elif c == 'edge_cor':
             (top_ed if is_top else bot_ed).append((b,s,c))
@@ -242,6 +330,8 @@ def _keep_two_gu_two_edge_leftmost(boxes, scores, classes, w, h):
         cx, cy = box_center(b)
         is_top = cy < h*0.5
         if c == 'gu_cor':
+            if s is None or s < globals().get('MIN_GU_CONF', 0.0):
+                continue
             (top_gu if is_top else bot_gu).append((b,s,c))
         elif c == 'edge_cor':
             (top_ed if is_top else bot_ed).append((b,s,c))
@@ -271,6 +361,8 @@ def _keep_two_gu_two_edge_rightmost(boxes, scores, classes, w, h):
         cx, cy = box_center(b)
         is_top = cy < h*0.5
         if c == 'gu_cor':
+            if s is None or s < globals().get('MIN_GU_CONF', 0.0):
+                continue
             (top_gu if is_top else bot_gu).append((b,s,c))
         elif c == 'edge_cor':
             (top_ed if is_top else bot_ed).append((b,s,c))
@@ -301,6 +393,10 @@ def _keep_two_gu_two_edge_global(boxes, scores, classes, w, h):
         cx, cy = box_center(b)
         is_top = cy < h * 0.5
         if c == 'gu_cor':
+            # treat very weak gu as low-priority: move into rest so edges are preferred
+            if s is None or s < globals().get('MIN_GU_CONF', 0.0):
+                rest.append((b, s, c))
+                continue
             (top_gu if is_top else bot_gu).append((b, s, c))
         elif c == 'edge_cor':
             (top_ed if is_top else bot_ed).append((b, s, c))
@@ -337,6 +433,112 @@ def _keep_two_gu_two_edge_global(boxes, scores, classes, w, h):
     return out_b, out_s, out_c
 
 
+def _suppress_cross_class_overlaps(boxes, scores, classes, iou_thresh=0.45):
+    """Post-process to remove duplicate detections with high overlap.
+    
+    Handles two types of overlaps:
+    1. Cross-class overlaps (gu_cor vs edge_cor): prefer edge_cor
+    2. Same-class overlaps (edge_cor vs edge_cor, gu_cor vs gu_cor): prefer higher confidence
+    
+    This prevents false seam splits caused by duplicate detections at the same corner.
+    Returns new (boxes, scores, classes) lists.
+    """
+    if not boxes:
+        return boxes, scores, classes
+    # compute IoU matrix
+    def iou(a,b):
+        x1,y1,x2,y2 = a
+        x1b,y1b,x2b,y2b = b
+        xa1 = max(x1,x1b); ya1 = max(y1,y1b)
+        xa2 = min(x2,x2b); ya2 = min(y2,y2b)
+        if xa2<=xa1 or ya2<=ya1:
+            return 0.0
+        inter = (xa2-xa1)*(ya2-ya1)
+        area_a = max(0,(x2-x1)) * max(0,(y2-y1))
+        area_b = max(0,(x2b-x1b)) * max(0,(y2b-y1b))
+        union = area_a + area_b - inter
+        return inter/union if union>0 else 0.0
+
+    keep = [True] * len(boxes)
+    # iterate over all pairs
+    for i, (bi, si, ci) in enumerate(zip(boxes, scores, classes)):
+        for j, (bj, sj, cj) in enumerate(zip(boxes, scores, classes)):
+            if i == j or not keep[i] or not keep[j]:
+                continue
+            _iou = iou(bi, bj)
+            if _iou > iou_thresh:
+                # Handle cross-class overlaps (gu_cor vs edge_cor)
+                if {ci, cj} == {'gu_cor', 'edge_cor'}:
+                    # prefer edge_cor
+                    if ci == 'edge_cor' and cj == 'gu_cor':
+                        keep[j] = False
+                    elif cj == 'edge_cor' and ci == 'gu_cor':
+                        keep[i] = False
+                # Handle same-class overlaps: prefer higher confidence
+                elif ci == cj:
+                    if si >= sj:
+                        keep[j] = False
+                    else:
+                        keep[i] = False
+    new_boxes = [b for k,b in zip(keep, boxes) if k]
+    new_scores = [s for k,s in zip(keep, scores) if k]
+    new_classes = [c for k,c in zip(keep, classes) if k]
+    return new_boxes, new_scores, new_classes
+
+
+def _resolve_selected_overlaps(boxes, scores, classes, iou_thresh=0.45):
+    """Ensure the small set of selected boxes (e.g. up to 4) have no
+    large overlaps. If two selected boxes overlap above iou_thresh, drop the
+    lower-priority one (prefer 'edge_cor' over 'gu_cor', otherwise higher score).
+    Returns filtered (boxes, scores, classes) preserving order as much as
+    possible but removing conflicting boxes.
+    """
+    if not boxes:
+        return boxes, scores, classes
+    n = len(boxes)
+    keep = [True] * n
+    def iou(a,b):
+        x1,y1,x2,y2 = a
+        x1b,y1b,x2b,y2b = b
+        xa1 = max(x1,x1b); ya1 = max(y1,y1b)
+        xa2 = min(x2,x2b); ya2 = min(y2,y2b)
+        if xa2<=xa1 or ya2<=ya1:
+            return 0.0
+        inter = (xa2-xa1)*(ya2-ya1)
+        area_a = max(0,(x2-x1)) * max(0,(y2-y1))
+        area_b = max(0,(x2b-x1b)) * max(0,(y2b-y1b))
+        union = area_a + area_b - inter
+        return inter/union if union>0 else 0.0
+
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(i+1, n):
+            if not keep[j]:
+                continue
+            _iou = iou(boxes[i], boxes[j])
+            if _iou > iou_thresh:
+                ci = classes[i]; cj = classes[j]
+                si = scores[i] if scores[i] is not None else -1
+                sj = scores[j] if scores[j] is not None else -1
+                # prefer edge_cor
+                if ci == 'edge_cor' and cj == 'gu_cor':
+                    keep[j] = False
+                elif cj == 'edge_cor' and ci == 'gu_cor':
+                    keep[i] = False
+                else:
+                    # keep higher score
+                    if si >= sj:
+                        keep[j] = False
+                    else:
+                        keep[i] = False
+
+    new_boxes = [b for k,b in zip(keep, boxes) if k]
+    new_scores = [s for k,s in zip(keep, scores) if k]
+    new_classes = [c for k,c in zip(keep, classes) if k]
+    return new_boxes, new_scores, new_classes
+
+
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
@@ -349,6 +551,7 @@ def main():
     ap.add_argument('--conf', type=float, default=0.05)
     ap.add_argument('--iou', type=float, default=0.6)
     ap.add_argument('--max-per-quad', type=int, default=1)
+    ap.add_argument('--seam-consec', type=int, default=1, help='Number of consecutive frames that must trigger seam before committing split')
 
     # corner refine params
     ap.add_argument('--no-corners', action='store_true', help='Skip corner refinement outputs')
@@ -368,7 +571,12 @@ def main():
     ap.add_argument('--corner-min-accept-score', type=float, default=10.0)
     ap.add_argument('--corner-head-area-thresh', type=float, default=2000.0)
     ap.add_argument('--corner-head-offset', type=int, default=20)
+    ap.add_argument('--min-gu-conf', type=float, default=0.20, help='Minimum confidence to treat a gu_cor as strong (below this prefer edge_cor)')
     args = ap.parse_args()
+
+    # global threshold used by helpers to treat weak gu_cor as low-priority
+    global MIN_GU_CONF
+    MIN_GU_CONF = float(args.min_gu_conf)
 
     out1 = Path(args.out1); out1.mkdir(parents=True, exist_ok=True)
     out2 = Path(args.out2); out2.mkdir(parents=True, exist_ok=True)
@@ -435,6 +643,8 @@ def main():
         )
 
     seam_found: bool = False
+    # deque to track recent seam triggers; size determined by --seam-consec
+    seam_window = deque(maxlen=max(1, args.seam_consec))
 
     total_files = len(files)
 
@@ -450,19 +660,33 @@ def main():
         h, w = img.shape[:2]
 
         boxes, scores, classes = run_detect(model, img, conf=args.conf, iou=args.iou)
+        # Post-process cross-class overlaps (gu_cor vs edge_cor)
+        boxes, scores, classes = _suppress_cross_class_overlaps(boxes, scores, classes, iou_thresh=0.45)
 
         # Decide which folder
         if not seam_found:
             # test seam condition
-            # NOTE: Ignore seam triggers for the first 6 and last 6 frames of the
+            # NOTE: Ignore seam triggers for the first 10 and last 10 frames of the
             # sequence as requested (these boundary frames should not cause a
             # split even if they contain >4 boxes or many gu_cor detections).
-            if pos < 6 or pos >= (total_files - 6):
+            if pos < 10 or pos >= (total_files - 10):
                 trigger = False
             else:
-                trigger = (len(boxes) > 4) or _gu_same_row_too_close(boxes, classes, w, h)
-            if trigger:
+                # Primary seam condition: presence of multiple gu_cor (container heads)
+                # indicating 2 containers in view. We require >= 4 gu_cor (2 per container)
+                # OR the secondary condition of gu_cor pairs too close horizontally.
+                # Total box count alone (>4) is NOT sufficient since noise detections
+                # (low-conf edge_cor) can cause false splits in single-container sequences.
+                num_gu = sum(1 for c in classes if c == 'gu_cor')
+                trigger = (num_gu >= 4) or _gu_same_row_too_close(boxes, classes, w, h)
+
+            # push into rolling window and decide only when enough consecutive
+            # triggers have been observed (helps ignore transient false positives)
+            seam_window.append(bool(trigger))
+            if sum(1 for v in seam_window if v) >= args.seam_consec:
+                # commit seam
                 seam_found = True
+                print(f"[{idx_label}] seam trigger committed (window={list(seam_window)})")
                 # estimate seam x from gu_cor pairs to split accurately
                 seam_x = _find_seam_x_from_gu(boxes, classes, h, w)
                 if seam_x is None:
@@ -480,10 +704,10 @@ def main():
                         print(f"[{idx_label}] {msg}; keeping left-side boxes only for C1 boundary")
                 out_dir = out1
             else:
-                # normal behavior for C1 segment
-                # Prefer gu-first to avoid losing gu near pre-boundary frames
+                # not yet committed; normal behavior for C1 segment
                 sel_b, sel_s, sel_c = _keep_two_gu_two_edge_global(boxes, scores, classes, w, h)
                 out_dir = out1
+            
         else:
             # We are in C2 segment
             # If early frames still contain both containers (e.g., multiple gu), enforce right-side 2 gu + 2 edge
@@ -506,6 +730,9 @@ def main():
                 # Prefer gu-first selection when available
                 sel_b, sel_s, sel_c = _keep_two_gu_two_edge_global(boxes, scores, classes, w, h)
             out_dir = out2
+
+        # Resolve overlaps among selected boxes (ensure final selection has no large overlaps)
+        sel_b, sel_s, sel_c = _resolve_selected_overlaps(sel_b, sel_s, sel_c, iou_thresh=0.45)
 
         # Save annotations
         labels = [c if c is not None else 'det' for c in sel_c]
@@ -531,15 +758,57 @@ def main():
         # refine corners
         force_head = [(c == 'gu_cor') for c in sel_c]
         corner_candidates = refine_corners(img, boxes_int, corner_params, force_head=force_head)
+        
+        # Create mapping: quadrant -> (candidate, bbox)
+        quad_to_data = {}
+        for cand, b_int in zip(corner_candidates, boxes_int):
+            quad_to_data[cand.quadrant] = (cand, b_int)
+        
+        # Validate bottom alignment and remove misaligned corner if needed
+        corners_dict = {cand.quadrant: cand.point for cand in corner_candidates}
+        validation_result = _validate_bottom_alignment(corners_dict, max_align_diff_px=40)
+        
+        # Validate bottom alignment (horizontal: BL.y vs BR.y)
+        if validation_result != 'valid':
+            # Remove the offending corner
+            if validation_result == 'remove_BL' and 'BL' in quad_to_data:
+                del quad_to_data['BL']
+                print(f"[{idx_label}] Removed BL corner due to horizontal misalignment (|BL.y - BR.y| > 40px)")
+            elif validation_result == 'remove_BR' and 'BR' in quad_to_data:
+                del quad_to_data['BR']
+                print(f"[{idx_label}] Removed BR corner due to horizontal misalignment (|BL.y - BR.y| > 40px)")
+        
+        # Validate vertical alignment (same column: TL.x vs BL.x, TR.x vs BR.x)
+        corners_dict_updated = {q: quad_to_data[q][0].point for q in quad_to_data}
+        corners_to_remove = _validate_vertical_alignment(corners_dict_updated, max_align_diff_px=80)
+        for q in corners_to_remove:
+            if q in quad_to_data:
+                tl_x = quad_to_data.get('TL', [None, None])[0].point[0] if 'TL' in quad_to_data else None
+                bl_x = quad_to_data.get('BL', [None, None])[0].point[0] if 'BL' in quad_to_data else None
+                tr_x = quad_to_data.get('TR', [None, None])[0].point[0] if 'TR' in quad_to_data else None
+                br_x = quad_to_data.get('BR', [None, None])[0].point[0] if 'BR' in quad_to_data else None
+                
+                if q in ('TL', 'BL') and tl_x is not None and bl_x is not None:
+                    diff_x = abs(tl_x - bl_x)
+                    del quad_to_data[q]
+                    print(f"[{idx_label}] Removed {q} corner due to vertical misalignment (|TL.x - BL.x| = {diff_x:.0f}px > 80px)")
+                elif q in ('TR', 'BR') and tr_x is not None and br_x is not None:
+                    diff_x = abs(tr_x - br_x)
+                    del quad_to_data[q]
+                    print(f"[{idx_label}] Removed {q} corner due to vertical misalignment (|TR.x - BR.x| = {diff_x:.0f}px > 80px)")
+        
+        # Write corners (may be 2, 3 or 4 corners now)
         corner_txt = out_dir / f"{idx_label}_corners.txt"
         with open(corner_txt, 'w') as f:
-            for cand, b_int in zip(corner_candidates, boxes_int):
-                x1,y1,x2,y2 = b_int
-                cx, cy = cand.point
-                f.write(f"{cand.quadrant} {cx} {cy} {cand.confidence:.4f} {cand.method} {x1} {y1} {x2} {y2}\n")
+            for quadrant in ['TL', 'TR', 'BR', 'BL']:  # consistent order
+                if quadrant in quad_to_data:
+                    cand, b_int = quad_to_data[quadrant]
+                    x1, y1, x2, y2 = b_int
+                    cx, cy = cand.point
+                    f.write(f"{cand.quadrant} {cx} {cy} {cand.confidence:.4f} {cand.method} {x1} {y1} {x2} {y2}\n")
 
         corners_vis = img.copy()
-        for cand in corner_candidates:
+        for quadrant, (cand, _) in quad_to_data.items():
             cx, cy = cand.point
             cv2.circle(corners_vis, (cx, cy), 6, (0,0,255), -1)
             txt = f"{cand.quadrant} {cand.confidence:.2f} {cand.method}"

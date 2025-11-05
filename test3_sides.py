@@ -252,10 +252,28 @@ def _vertical_min_error_seam(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
     Returns mask_new (uint8) same shape as a[...,0], with 1 where we take from b, 0 from a.
     """
-    # Use grayscale absolute difference as cost; robust and fast
+    # Use gradient magnitude + color difference as cost
+    # This makes seam avoid edges while considering color mismatches
     ag = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
     bg = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
-    diff = cv2.absdiff(ag, bg).astype(np.float32) + 1.0  # avoid zeros
+    
+    # Gradient magnitude: seam should avoid high-gradient areas (edges, text)
+    grad_a_x = cv2.Sobel(ag, cv2.CV_32F, 1, 0, ksize=3)
+    grad_a_y = cv2.Sobel(ag, cv2.CV_32F, 0, 1, ksize=3)
+    grad_b_x = cv2.Sobel(bg, cv2.CV_32F, 1, 0, ksize=3)
+    grad_b_y = cv2.Sobel(bg, cv2.CV_32F, 0, 1, ksize=3)
+    
+    mag_a = np.sqrt(grad_a_x**2 + grad_a_y**2)
+    mag_b = np.sqrt(grad_b_x**2 + grad_b_y**2)
+    grad_cost = (mag_a + mag_b) / 2.0  # Average gradient magnitude
+    
+    # Color difference cost: penalize mismatches
+    color_diff = cv2.absdiff(ag, bg).astype(np.float32)
+    
+    # Combined cost: gradient (prefer low-gradient areas) + color difference
+    # Weight gradient higher to prioritize smooth areas
+    diff = grad_cost * 2.0 + color_diff + 1.0  # avoid zeros
+    
     h, w = diff.shape
     if w <= 2 or h <= 2:
         return np.ones((h, w), dtype=np.uint8)  # default to new on narrow region

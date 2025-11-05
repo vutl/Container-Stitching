@@ -112,11 +112,32 @@ def main():
     out_annot1.mkdir(parents=True, exist_ok=True)
     out_annot2.mkdir(parents=True, exist_ok=True)
 
+    # If find_direction.py was run beforehand it will have written
+    # direction.txt in the container folder. If that file indicates
+    # 'right-to-left' and an 'img_rev' subfolder exists, use that as the
+    # image source. Otherwise use the provided img_dir.
+    src_dir = img_dir
+    direction_file = img_dir / 'direction.txt'
+    if direction_file.exists():
+        direction = direction_file.read_text().strip()
+        direction_norm = direction.replace('_', '-').lower()
+        if direction_norm == 'right-to-left':
+            rev_dir = img_dir / 'img_rev'
+            if rev_dir.exists() and rev_dir.is_dir():
+                src_dir = rev_dir
+                print(f"[DIRECTION] Using reversed image folder: {rev_dir}")
+            else:
+                print(f"[DIRECTION] direction.txt indicates right-to-left but {rev_dir} not found; using {img_dir}")
+        else:
+            print(f"[DIRECTION] Detected direction: {direction} — using images in {img_dir}")
+    else:
+        print("[DIRECTION] direction.txt not found: using images in container folder")
+
     detect_script = str((Path(__file__).parent / 'test_sides_split.py').resolve())
     cmd_detect = [
         sys.executable, detect_script,
         '--model', str(args.model),
-        '--dir', str(img_dir),
+        '--dir', str(src_dir),
         '--suffix', args.suffix,
         '--out1', str(out_annot1),
         '--out2', str(out_annot2),
@@ -148,7 +169,7 @@ def main():
     trim_script = str((Path(__file__).parent / 'trim_black_update_corners_split.py').resolve())
     cmd_trim = [
         sys.executable, trim_script,
-        '--img-dir', str(img_dir),
+        '--img-dir', str(src_dir),
         '--suffix', args.suffix,
         '--corners1-dir', str(out_annot1),
         '--corners2-dir', str(out_annot2),
