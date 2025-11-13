@@ -46,7 +46,7 @@ How to run (typical full-side pipeline)
 ---------------------------------------
 1. Detect corners for raw side images (from using yolo to detect corner bounding boxes to using those boxes to find the exact corners):
 
-   python3 test.py ...
+   python3 test3_sides.py --aligned-dir ... --corners-dir ... --detector kaze --lock-dy --blend seam --seam-width 5 --stride 2 --out ...
 
 2. (Optional) Trim black borders and update corner files:
 

@@ -157,7 +157,8 @@ def process_image(img_path: Path,
 
     cropped = img[top:bottom + 1, left:right + 1]
 
-    idx = img_path.name.split('_')[0]
+    # Use the full stem (e.g. 'img_0') so we match corner files like 'img_0_corners.txt'
+    idx = img_path.stem
     corners_root = corners_dir if corners_dir is not None else img_path.parent
     corners_out_root = corners_out_dir if corners_out_dir is not None else corners_root
     corners_path = corners_root / f"{idx}{corners_suffix}"

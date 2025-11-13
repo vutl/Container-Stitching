@@ -188,7 +188,11 @@ def _find_corner_in_box(img: np.ndarray,
         cx, cy = box_center(box)
         pt = (int(round(cx)), int(round(cy)))
         return CornerCandidate(quadrant, pt, 0.0, "bbox_fallback", box)
-
+    
+    # For small bboxes (typical edge_cor ~40-50px), restrict search to a tight window
+    # around the center (±5-10px) to avoid edge aliasing from corrugated textures.
+    use_tight_center = (bw < 60 and bh < 60)
+    
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
@@ -198,7 +202,14 @@ def _find_corner_in_box(img: np.ndarray,
 
     cx_rel = bw // 2
     cy_rel = bh // 2
-    r = max(1, int(params.center_near_px))
+    
+    # For small bboxes, use a very tight search window around center (±5-10px).
+    # For larger bboxes, use the standard params.center_near_px.
+    if use_tight_center:
+        r = max(1, min(5, bw // 4, bh // 4))  # 5-10px radius depending on bbox size
+    else:
+        r = max(1, int(params.center_near_px))
+    
     c0 = max(0, cx_rel - r)
     c1 = min(bw, cx_rel + r + 1)
     r0 = max(0, cy_rel - r)
@@ -209,35 +220,27 @@ def _find_corner_in_box(img: np.ndarray,
     thr_c_whole = _dynamic_threshold(whole_col, params.perc, params.perc_alpha, params.std_mult)
     thr_r_whole = _dynamic_threshold(whole_row, params.perc, params.perc_alpha, params.std_mult)
 
-    center_gx = gx[r0:r1, c0:c1]
-    center_gy = gy[r0:r1, c0:c1]
-    sum_cx_center = float(center_gx.sum()) if center_gx.size else 0.0
-    sum_gy_center = float(center_gy.sum()) if center_gy.size else 0.0
-    center_thr_c = thr_c_whole * params.center_thr_alpha
-    center_thr_r = thr_r_whole * params.center_thr_alpha
+    # NOTE: Previously we returned early when the center window had strong
+    # gradients ("center_local"). That can pull regular (non-head) corners
+    # slightly inward. We now defer this check until after side-edge search
+    # and global fallbacks. This keeps regular corners hugging the silhouette.
 
-    if sum_cx_center >= center_thr_c and sum_gy_center >= center_thr_r:
-        cols = np.arange(c0, c1)
-        rows = np.arange(r0, r1)
-        col_weights = center_gx.sum(axis=0)
-        row_weights = center_gy.sum(axis=1)
-        sub_c = _weighted_centroid_1d(col_weights, cols) if cols.size else cx_rel
-        sub_r = _weighted_centroid_1d(row_weights, rows) if rows.size else cy_rel
-        x_abs = x1 + sub_c
-        y_abs = y1 + sub_r
-        conf = float(1.0 - math.exp(-0.0005 * ((sum_cx_center + sum_gy_center) / 2.0)))
-        return CornerCandidate(quadrant,
-                               (int(round(x_abs)), int(round(y_abs))),
-                               conf,
-                               "center_local",
-                               box)
+    # For small bboxes, restrict side-edge search to a narrow vertical window around center.
+    # For larger bboxes, use the standard center_window_frac (45%).
+    if use_tight_center:
+        # Tight window: center ±5px vertical range
+        tight_range = 5
+        center_r0 = int(max(0, cy_rel - tight_range))
+        center_r1 = int(min(bh, cy_rel + tight_range + 1))
+    else:
+        center_r0 = int(round(bh * (0.5 - params.center_window_frac / 2.0)))
+        center_r1 = int(round(bh * (0.5 + params.center_window_frac / 2.0)))
+    
+    center_r0 = int(_clamp(center_r0, 0, bh - 1))
+    center_r1 = max(center_r0 + 1, int(_clamp(center_r1, 0, bh)))
 
     side_px = max(int(params.side_margin_frac * bw), params.min_side_px)
     side_px = min(side_px, max(1, bw // 2))
-    center_r0 = int(round(bh * (0.5 - params.center_window_frac / 2.0)))
-    center_r1 = int(round(bh * (0.5 + params.center_window_frac / 2.0)))
-    center_r0 = int(_clamp(center_r0, 0, bh - 1))
-    center_r1 = max(center_r0 + 1, int(_clamp(center_r1, 0, bh)))
 
     left_gx = gx[center_r0:center_r1, 0:side_px] if side_px > 0 else np.zeros((0, 0))
     right_gx = gx[center_r0:center_r1, max(0, bw - side_px):bw] if side_px > 0 else np.zeros((0, 0))
@@ -247,7 +250,16 @@ def _find_corner_in_box(img: np.ndarray,
 
     best_left = None
     if left_gx.size > 0:
-        idx = np.unravel_index(np.argmax(left_gx), left_gx.shape)
+        # Penalize edges far from bbox vertical center to prefer those near the expected corner position
+        center_dist_penalty = 0.15  # Weight factor for distance penalty
+        scores = np.zeros_like(left_gx)
+        for r_local in range(left_gx.shape[0]):
+            r_abs = center_r0 + r_local
+            dist_from_center = abs(r_abs - cy_rel) / float(max(1, bh))
+            penalty = 1.0 + center_dist_penalty * dist_from_center
+            scores[r_local, :] = left_gx[r_local, :] / penalty
+        
+        idx = np.unravel_index(np.argmax(scores), scores.shape)
         val = float(left_gx[idx])
         if val >= thr_left and val > 0:
             row = center_r0 + idx[0]
@@ -256,7 +268,16 @@ def _find_corner_in_box(img: np.ndarray,
 
     best_right = None
     if right_gx.size > 0:
-        idx = np.unravel_index(np.argmax(right_gx), right_gx.shape)
+        # Same distance penalty for right side
+        center_dist_penalty = 0.15
+        scores = np.zeros_like(right_gx)
+        for r_local in range(right_gx.shape[0]):
+            r_abs = center_r0 + r_local
+            dist_from_center = abs(r_abs - cy_rel) / float(max(1, bh))
+            penalty = 1.0 + center_dist_penalty * dist_from_center
+            scores[r_local, :] = right_gx[r_local, :] / penalty
+        
+        idx = np.unravel_index(np.argmax(scores), scores.shape)
         val = float(right_gx[idx])
         if val >= thr_right and val > 0:
             row = center_r0 + idx[0]
@@ -267,6 +288,11 @@ def _find_corner_in_box(img: np.ndarray,
     chosen_score: float = 0.0
     chosen_method: Optional[str] = None
 
+    # Prefer the vertical side that matches the quadrant (left for TL/BL,
+    # right for TR/BR). We'll apply a small bias to the preferred side.
+    prefer_left = quadrant in ("TL", "BL")
+    bias_factor = 1.05  # ~5% nudge towards the expected side
+
     if best_left is not None:
         col_l, row_l, val_l = best_left
         row_refined, gy_val = _refine_row_from_col(gy, bw, bh, col_l, row_l, params, params.refine_search_h)
@@ -274,6 +300,8 @@ def _find_corner_in_box(img: np.ndarray,
         x_abs = x1 + col_refined
         y_abs = y1 + row_refined
         score = (val_l + gy_val + gx_val) / 3.0
+        if prefer_left:
+            score *= bias_factor
         chosen_point = (x_abs, y_abs)
         chosen_score = score
         chosen_method = "gradient_left"
@@ -285,11 +313,39 @@ def _find_corner_in_box(img: np.ndarray,
         x_abs = x1 + col_refined
         y_abs = y1 + row_refined
         score = (val_r + gy_val + gx_val) / 3.0
+        if not prefer_left:
+            score *= bias_factor
         if chosen_point is None or score > chosen_score:
             chosen_point = (x_abs, y_abs)
             chosen_score = score
             chosen_method = "gradient_right"
 
+    # Optional row boost: if a significantly stronger horizontal edge (gy)
+    # exists near the bbox, snap the row to that edge and re-refine the
+    # column on that row. This avoids keeping a slightly too-high/low y
+    # chosen purely from the side-edge search.
+    # DISABLED for TL/TR to prevent drift on corrugated textures (multiple strong horizontal edges).
+    apply_row_boost = quadrant in ("BR", "BL")
+    if chosen_point is not None and apply_row_boost:
+        row_sum_total = gy.sum(axis=1)
+        if row_sum_total.size:
+            r_idx = int(np.argmax(row_sum_total))
+            thr_r_boost = _dynamic_threshold(row_sum_total, params.perc, params.perc_alpha, params.std_mult)
+            cur_r = int(round(chosen_point[1] - y1))
+            if 0 <= cur_r < bh and row_sum_total[r_idx] >= thr_r_boost:
+                cur_strength = float(row_sum_total[cur_r])
+                # Require a modest improvement to avoid oscillation
+                if row_sum_total[r_idx] > cur_strength * 1.05:
+                    col_seed = int(round(chosen_point[0] - x1))
+                    col_refined2, gx_val2 = _refine_col_from_row(gx, bw, bh, r_idx, col_seed, params, params.refine_search_w)
+                    chosen_point = (x1 + col_refined2, y1 + r_idx)
+                    # Update score conservatively using boosted row strength
+                    chosen_score = max(chosen_score, float((gx_val2 + row_sum_total[r_idx]) / 2.0))
+                    chosen_method = (chosen_method or "gradient_combo") + "+row_boost"
+
+    # If side-edge search did not yield a confident point, try a
+    # quadrant-centered local search to intersect strong vertical/horizontal
+    # responses near the bbox center.
     if chosen_point is None:
         lc0 = max(0, cx_rel - params.center_near_px)
         lc1 = min(bw, cx_rel + params.center_near_px + 1)
@@ -310,6 +366,7 @@ def _find_corner_in_box(img: np.ndarray,
                     chosen_score = float((gx[:, lc_idx].sum() + gy[lr_idx, :].sum()) / 2.0)
                     chosen_method = "center_near_search"
 
+    # Try a global max of vertical/horizontal energy within the box.
     if chosen_point is None or chosen_score < params.min_accept_score:
         col_sum_total = gx.sum(axis=0)
         row_sum_total = gy.sum(axis=1)
@@ -325,12 +382,58 @@ def _find_corner_in_box(img: np.ndarray,
                 chosen_score = float((col_sum_total[c_idx] + row_sum_total[r_idx]) / 2.0)
                 chosen_method = "gradient_global"
 
+    # Finally, consider the center-local response as a last resort.
+    if chosen_point is None:
+        center_gx = gx[r0:r1, c0:c1]
+        center_gy = gy[r0:r1, c0:c1]
+        sum_cx_center = float(center_gx.sum()) if center_gx.size else 0.0
+        sum_gy_center = float(center_gy.sum()) if center_gy.size else 0.0
+        center_thr_c = thr_c_whole * params.center_thr_alpha
+        center_thr_r = thr_r_whole * params.center_thr_alpha
+        if sum_cx_center >= center_thr_c and sum_gy_center >= center_thr_r:
+            cols = np.arange(c0, c1)
+            rows = np.arange(r0, r1)
+            col_weights = center_gx.sum(axis=0)
+            row_weights = center_gy.sum(axis=1)
+            sub_c = _weighted_centroid_1d(col_weights, cols) if cols.size else cx_rel
+            sub_r = _weighted_centroid_1d(row_weights, rows) if rows.size else cy_rel
+            x_abs = x1 + sub_c
+            y_abs = y1 + sub_r
+            conf = float(1.0 - math.exp(-0.0005 * ((sum_cx_center + sum_gy_center) / 2.0)))
+            chosen_point = (x_abs, y_abs)
+            chosen_score = max(sum_cx_center, sum_gy_center)
+            chosen_method = "center_local"
+
     if chosen_point is None:
         cx_box, cy_box = box_center(box)
         pt = (int(round(cx_box)), int(round(cy_box)))
         return CornerCandidate(quadrant, pt, 0.0, "bbox_fallback", box)
 
     conf = float(1.0 - math.exp(-0.0005 * max(chosen_score, 0.0))) if chosen_score > 0 else 0.0
+
+    # Subpixel snap using cornerSubPix to reduce small inward drift.
+    # We refine on the local crop using the predicted point as the seed.
+    px_f = float(chosen_point[0] - x1)
+    py_f = float(chosen_point[1] - y1)
+    # Ensure seed lies inside the crop (cornerSubPix requires valid interior point)
+    if 1 <= px_f < (bw - 1) and 1 <= py_f < (bh - 1):
+        seed = np.array([[[px_f, py_f]]], dtype=np.float32)
+        try:
+            cv2.cornerSubPix(
+                gray,
+                seed,
+                winSize=(3, 3),
+                zeroZone=(-1, -1),
+                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.01),
+            )
+            sub_x = float(seed[0, 0, 0])
+            sub_y = float(seed[0, 0, 1])
+            chosen_point = (x1 + sub_x, y1 + sub_y)
+            if chosen_method is not None:
+                chosen_method = f"{chosen_method}+subpix"
+        except Exception:
+            pass
+
     pt = (int(round(chosen_point[0])), int(round(chosen_point[1])))
     return CornerCandidate(quadrant, pt, conf, chosen_method or "gradient_combo", box)
 

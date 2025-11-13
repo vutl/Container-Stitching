@@ -1,0 +1,36 @@
+{
+  "lineConfig": {
+    "weight": "resources/weights/last11s_3lines_20_5.pt",
+    "conf": 0.25,
+    "imgsz": 640,
+    "device": "cuda:1"
+  },
+  "dentConfig": {
+    "weight": "resources/weights/lastdent11s_5_5.pt",
+    "conf": 0.25,
+    "imgsz": 640,
+    "device": "cuda:1"
+  },
+  "blackBoxConfig": {
+    "weight": "resources/weights/last_blackbox11n_19_11_sz640.pt",
+    "conf": 0.4,
+    "imgsz": 640,
+    "device": "cuda:1"
+  },
+  "cornersConfig": {
+    "weight": "/resources/weights/last11scor_3class_31_07.pt",
+    "conf": 0.3,
+    "imgsz": 640,
+    "device": "cuda:1"
+  },
+  "cornersTopConfig": {
+    "weight": "resources/weights/last11s_cortop_10_08.pt",
+    "conf": 0.3,
+    "imgsz": 640,
+    "device": "cuda:1"
+  },
+  "superGlueConfig": {
+    "weightSuperGlue": "resources/weights/superglue_outdoor.pth",
+    "weightSuperPoint": "resources/weights/superpoint_v1.pth"
+  }
+}

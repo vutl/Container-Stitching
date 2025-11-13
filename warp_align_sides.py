@@ -62,8 +62,32 @@ def load_frames(img_dir: Path, corners_dir: Path, img_suffix: str, corners_suffi
                 indices: Iterable[int]) -> List[Frame]:
     frames: List[Frame] = []
     for i in indices:
+        # primary pattern: exactly <index><img_suffix> (e.g. 12_trim.jpg)
         ip = img_dir / f"{i}{img_suffix}"
         cp = corners_dir / f"{i}{corners_suffix}"
+
+        # fallback: filenames that include an 'img_' prefix (e.g. img_12_trim.jpg)
+        if not ip.exists():
+            alt_ip = img_dir / f"img_{i}{img_suffix}"
+            if alt_ip.exists():
+                ip = alt_ip
+
+        if not cp.exists():
+            alt_cp = corners_dir / f"img_{i}{corners_suffix}"
+            if alt_cp.exists():
+                cp = alt_cp
+
+        # final fallback: glob for any file that ends with the numeric index + suffix
+        if not ip.exists():
+            matches = list(img_dir.glob(f"*{i}{img_suffix}"))
+            if len(matches) == 1:
+                ip = matches[0]
+
+        if not cp.exists():
+            matches = list(corners_dir.glob(f"*{i}{corners_suffix}"))
+            if len(matches) == 1:
+                cp = matches[0]
+
         if not ip.exists() or not cp.exists():
             print(f"skip {i} (missing)")
             continue

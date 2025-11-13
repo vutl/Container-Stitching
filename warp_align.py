@@ -68,10 +68,10 @@ class Frame:
 
 
 def load_frames(img_dir: Path, corners_dir: Path, img_suffix: str, corners_suffix: str,
-                indices: Iterable[int]) -> List[Frame]:
+                indices: Iterable[int], img_prefix: str = '') -> List[Frame]:
     frames: List[Frame] = []
     for i in indices:
-        ip = img_dir / f"{i}{img_suffix}"
+        ip = img_dir / f"{img_prefix}{i}{img_suffix}"
         cp = corners_dir / f"{i}{corners_suffix}"
         if not ip.exists() or not cp.exists():
             print(f"skip {i} (missing)")
@@ -99,6 +99,7 @@ def main():
     ap.add_argument('--dir', required=True)
     ap.add_argument('--indices', required=True)
     ap.add_argument('--img-suffix', default='_cropped_padded.jpg')
+    ap.add_argument('--img-prefix', default='', help='Prefix for image filenames (e.g., "img_" for img_0.jpg)')
     ap.add_argument('--corners-dir', default='out_annot')
     ap.add_argument('--corners-suffix', default='_corners.txt')
     ap.add_argument('--out', default='aligned')
@@ -112,7 +113,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     idxs = parse_indices(args.indices)
-    frames = load_frames(img_dir, corners_dir, args.img_suffix, args.corners_suffix, idxs)
+    frames = load_frames(img_dir, corners_dir, args.img_suffix, args.corners_suffix, idxs, args.img_prefix)
     if not frames:
         print('No frames matched inputs; nothing to do.')
         return

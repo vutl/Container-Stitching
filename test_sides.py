@@ -3,10 +3,10 @@
 
 """
 Same as test.py but use YOLO class names to decide head vs regular corners.
-- If a detection's class name is 'edge_cor' we treat it as container-head corner
-  (use the head-offset rule to place the corner).
-- If class name is 'gu_cor' we treat it as a regular corner and run the
-  gradient-based refinement.
+- If a detection's class name is 'gu_cor' we treat it as container-head corner
+    (use the head-offset rule to place the corner).
+- If class name is 'edge_cor' we treat it as a regular corner and run the
+    gradient-based refinement.
 """
 
 import argparse
@@ -99,6 +99,7 @@ def main():
     ap.add_argument('--indices', type=str, nargs='+', required=True,
                     help="numbers or ranges like 54 60-65")
     ap.add_argument('--suffix', type=str, default='_cropped_padded.jpg')
+    ap.add_argument('--prefix', type=str, default='', help='Prefix for image filenames (e.g., "img_" for img_0.jpg)')
     ap.add_argument('--out', type=str, required=True, default='out_annot_sides')
     ap.add_argument('--conf', type=float, default=0.05)
     ap.add_argument('--iou', type=float, default=0.6)
@@ -166,7 +167,7 @@ def main():
         )
 
     for i in idxs:
-        p = Path(args.dir) / f"{i}{args.suffix}"
+        p = Path(args.dir) / f"{args.prefix}{i}{args.suffix}"
         if not p.exists():
             print(f"Missing: {p}"); continue
         img = cv2.imread(str(p))

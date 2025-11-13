@@ -11,6 +11,8 @@ def draw_boxes(img, boxes, labels, scores=None):
         "pred_3":  (255,128,  0),   # orange
         "pred_2":  (0, 128, 255),   # blue
         "pred_1":  (180,  0, 180),  # purple
+        "raw":     (0, 200, 200),   # cyan-ish for raw
+        "filt":    (200, 200, 0),   # yellow-ish for filtered
     }
     for i, b in enumerate(boxes):
         x1, y1, x2, y2 = [int(round(v)) for v in b]
@@ -252,30 +254,90 @@ def load_model(model_path):
 
 def run_detect(model, img, conf, iou):
     res = model.predict(img, conf=conf, iou=iou, verbose=False)
-    r = res[0] if isinstance(res, (list,tuple)) else res
-    boxes, scores = [], []
+    r = res[0] if isinstance(res, (list, tuple)) else res
+    boxes, scores, classes = [], [], []
     try:
         b = r.boxes.xyxy.cpu().numpy()
         s = r.boxes.conf.cpu().numpy()
-        for bb, sc in zip(b, s):
+        cls = r.boxes.cls.cpu().numpy()
+        names = None
+        try:
+            names = model.model.names
+        except Exception:
+            try:
+                names = model.names
+            except Exception:
+                names = None
+        for bb, sc, cc in zip(b, s, cls):
             boxes.append(bb.tolist())
             scores.append(float(sc))
+            if names is None:
+                classes.append(str(int(cc)))
+            else:
+                classes.append(str(names.get(int(cc), str(int(cc)))))
     except Exception:
         pass
-    return boxes, scores
+    return boxes, scores, classes
 
-def keep_best_per_quadrant(boxes, scores, w, h, max_per_quad=1):
+def keep_best_per_quadrant(boxes, scores, w, h, max_per_quad=1, classes=None):
     quads = {"TL":[], "TR":[], "BL":[], "BR":[]}
-    for b, s in zip(boxes, scores):
+    for idx, (b, s) in enumerate(zip(boxes, scores)):
         cx, cy = box_center(b)
         q = assign_quadrant(cx, cy, w, h)
-        quads[q].append((b, s))
-    kept_boxes, kept_scores = [], []
+        lab = classes[idx] if classes is not None and idx < len(classes) else None
+        quads[q].append((b, s, lab))
+    kept_boxes, kept_scores, kept_classes = [], [], []
     for q in quads:
         quads[q].sort(key=lambda x: x[1], reverse=True)
-        for b,s in quads[q][:max_per_quad]:
-            kept_boxes.append(b); kept_scores.append(s)
-    return kept_boxes, kept_scores
+        for b,s,lab in quads[q][:max_per_quad]:
+            kept_boxes.append(b); kept_scores.append(s); kept_classes.append(lab)
+    return kept_boxes, kept_scores, kept_classes
+
+
+# ========== Filter middle seam boxes (two adjacent containers) ==========
+def filter_middle_seam_boxes(boxes, scores, classes, w, h,
+                             seam_frac=0.08, min_score=0.1,
+                             require_top_bottom_pair=True,
+                             prefer_class='gu_cor'):
+    """Drop detections hugging the vertical midline when they likely belong to
+    the junction of two adjacent containers.
+
+    Heuristic:
+      - Compute vertical midline xmid = w/2.
+      - Mark seam candidates if |cx - xmid| <= seam_frac*w.
+      - Optionally require at least one candidate in top half and one in bottom
+        half (to avoid triggering on single-container cases).
+      - If class names are available, prefer filtering those matching
+        prefer_class (e.g., 'gu_cor') first.
+    """
+    if not boxes:
+        return boxes, scores, classes
+    xmid = w * 0.5
+    tol = max(12.0, seam_frac * w)
+    cxs = [box_center(b)[0] for b in boxes]
+    cys = [box_center(b)[1] for b in boxes]
+    seam_idx = [i for i, (cx, sc) in enumerate(zip(cxs, scores)) if abs(cx - xmid) <= tol and sc >= min_score]
+    if not seam_idx:
+        return boxes, scores, classes
+    has_top = any(cys[i] < (h * 0.5) for i in seam_idx)
+    has_bot = any(cys[i] >= (h * 0.5) for i in seam_idx)
+    if require_top_bottom_pair and not (has_top and has_bot):
+        return boxes, scores, classes
+    # Prefer removing prefer_class if present; otherwise remove all seam candidates
+    remove_set = set()
+    if classes:
+        for i in seam_idx:
+            if str(classes[i]) == prefer_class:
+                remove_set.add(i)
+    if not remove_set:
+        remove_set.update(seam_idx)
+
+    f_boxes, f_scores, f_classes = [], [], []
+    for i, (b, s) in enumerate(zip(boxes, scores)):
+        if i in remove_set:
+            continue
+        f_boxes.append(b); f_scores.append(s); f_classes.append(classes[i] if classes else None)
+    return f_boxes, f_scores, f_classes
 
 # ========== Main ==========
 def main():
@@ -288,6 +350,15 @@ def main():
     ap.add_argument('--conf', type=float, default=0.25)
     ap.add_argument('--iou', type=float, default=0.6)
     ap.add_argument('--max-per-quad', type=int, default=1)
+    # toggles/outputs
+    ap.add_argument('--disable-midline-filter', action='store_true', help='Skip midline seam filter')
+    ap.add_argument('--no-quadrant-prune', action='store_true', help='Do not keep only best per quadrant')
+    ap.add_argument('--save-raw', action='store_true', help='Also save raw detections overlay (pre-filter/prune)')
+    ap.add_argument('--save-filter', action='store_true', help='Also save after midline-filter overlay')
+    # filter tunables
+    ap.add_argument('--seam-frac', type=float, default=0.08, help='Half-width around vertical midline for seam filter, as fraction of width')
+    ap.add_argument('--min-seam-score', type=float, default=0.1, help='Min score to consider for seam filtering')
+    ap.add_argument('--require-top-bottom-pair', action='store_true', help='Only filter if seam candidates exist in both halves')
     # bounds tunables
     ap.add_argument('--col-frac-thr', type=float, default=0.98)
     ap.add_argument('--row-top', type=float, default=0.18)
@@ -307,10 +378,35 @@ def main():
         h, w = img.shape[:2]
 
         # --- 1) Detect
-        boxes, scores = run_detect(model, img, conf=args.conf, iou=args.iou)
-        boxes, scores = keep_best_per_quadrant(boxes, scores, w, h, args.max_per_quad)
+        boxes, scores, classes = run_detect(model, img, conf=args.conf, iou=args.iou)
+        raw_boxes, raw_scores, raw_classes = boxes[:], scores[:], classes[:]
+        if args.save_raw:
+            raw_labels = ["raw" for _ in raw_boxes]
+            annotated_raw = draw_boxes(img, raw_boxes, raw_labels, raw_scores)
+            outp_raw = out_dir / f"{i}_annot_raw.jpg"
+            cv2.imwrite(str(outp_raw), annotated_raw)
+            print(f"Wrote: {outp_raw} (raw: {len(raw_boxes)} boxes)")
 
-        labels = ["det"] * len(boxes)
+        # Drop boxes near vertical midline when two-container seam is present
+        if not args.disable_midline_filter:
+            boxes, scores, classes = filter_middle_seam_boxes(
+                boxes, scores, classes, w, h,
+                seam_frac=args.seam_frac,
+                min_score=args.min_seam_score,
+                require_top_bottom_pair=args.require_top_bottom_pair,
+            )
+        if args.save_filter:
+            filt_labels = ["filt" for _ in boxes]
+            annotated_filt = draw_boxes(img, boxes, filt_labels, scores)
+            outp_filt = out_dir / f"{i}_annot_filter.jpg"
+            cv2.imwrite(str(outp_filt), annotated_filt)
+            print(f"Wrote: {outp_filt} (filtered: {len(boxes)} boxes)")
+
+        # Optionally keep many per quadrant, or skip pruning
+        if not args.no_quadrant_prune:
+            boxes, scores, classes = keep_best_per_quadrant(boxes, scores, w, h, args.max_per_quad, classes)
+
+        labels = [c if c is not None else "det" for c in classes]
 
         # --- 2) Estimate bounds once per image
         x_left, x_right = estimate_lr_bounds(
@@ -339,7 +435,7 @@ def main():
         annotated = draw_boxes(img, boxes, labels, scores)
         outp = out_dir / f"{i}_annot_cropped.jpg"
         cv2.imwrite(str(outp), annotated)
-        print(f"Wrote: {outp}")
+        print(f"Wrote: {outp} (final: {len(boxes)} boxes)")
 
     print("Done.")
 
