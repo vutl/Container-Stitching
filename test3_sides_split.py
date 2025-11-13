@@ -31,7 +31,7 @@ def main():
     ap.add_argument('--lock-dy', action='store_true')
     ap.add_argument('--seam-width', type=int, default=1)
     ap.add_argument('--detector', type=str, default=None, choices=['sift', 'orb', 'akaze', 'kaze'])
-    ap.add_argument('--reverse', action='store_true', help='Process frames in descending order (right-to-left)')
+    ap.add_argument('--loftr-weights', type=str, default=None, help='Path to EfficientLoFTR checkpoint to use for matching')
     args = ap.parse_args()
 
     script = str((Path(__file__).parent / 'test3_sides.py').resolve())
@@ -50,8 +50,8 @@ def main():
         cmd1.append('--lock-dy')
     if args.detector:
         cmd1 += ['--detector', args.detector]
-    if args.reverse:
-        cmd1.append('--reverse')
+    if args.loftr_weights:
+        cmd1 += ['--loftr-weights', args.loftr_weights]
     subprocess.run(cmd1, check=True)
 
     # Segment 2
@@ -70,8 +70,8 @@ def main():
             cmd2.append('--lock-dy')
         if args.detector:
             cmd2 += ['--detector', args.detector]
-        if args.reverse:
-            cmd2.append('--reverse')
+        if args.loftr_weights:
+            cmd2 += ['--loftr-weights', args.loftr_weights]
         subprocess.run(cmd2, check=True)
     else:
         print('Segment 2 skipped: single-container mode.')

@@ -11,6 +11,18 @@ from typing import List, Dict, Tuple, Optional
 
 import cv2
 import numpy as np
+import sys
+import torch
+import matplotlib.pyplot as plt
+
+from blending import ImageBlender, BlendResult
+
+
+# Globals for optional LoFTR matcher (initialized lazily)
+_LOFTR_MATCHER = None
+_LOFTR_PRECISION = 'fp32'
+_LOFTR_WEIGHTS = None
+_FORCE_DET = None
 
 
 # -------------------- helpers --------------------
@@ -99,6 +111,8 @@ def get_detector():
     forced = globals().get('_FORCE_DET', None)
     if forced is not None:
         f = str(forced).lower()
+        if f == 'loftr' or f == 'eloftr':
+            return None, 'LOFTR'
         if f == 'sift' and hasattr(cv2, 'SIFT_create'):
             return cv2.SIFT_create(), 'SIFT'
         if f == 'akaze' and hasattr(cv2, 'AKAZE_create'):
@@ -114,6 +128,155 @@ def get_detector():
     if hasattr(cv2, 'xfeatures2d') and hasattr(cv2.xfeatures2d, 'SIFT_create'):
         return cv2.xfeatures2d.SIFT_create(), 'SIFT'
     return cv2.ORB_create(4000), 'ORB'
+
+
+def init_loftr(weights_path: Optional[str], model_type: str = 'full', precision: str = 'fp32'):
+    """Initialize EfficientLoFTR matcher from checkpoint path.
+    weights_path: path to eloftr_outdoor.ckpt (string or Path)
+    model_type: 'full' or 'opt'
+    precision: 'fp32', 'mp', or 'fp16'
+    Returns the matcher (on CUDA if available).
+    """
+    global _LOFTR_MATCHER, _LOFTR_PRECISION
+    if weights_path is None:
+        raise ValueError('weights_path must be provided to init LoFTR')
+    if _LOFTR_MATCHER is not None:
+        return _LOFTR_MATCHER
+
+    # Add EfficientLoFTR package folder to sys.path if present
+    base = Path(__file__).parent.resolve()
+    eloftr_pkg = base / 'EfficientLoFTR'
+    if str(eloftr_pkg) not in sys.path and eloftr_pkg.exists():
+        sys.path.insert(0, str(eloftr_pkg))
+
+    try:
+        from EfficientLoFTR.src.loftr import LoFTR, full_default_cfg, opt_default_cfg, reparameter
+    except Exception as e:
+        raise ImportError('Cannot import LoFTR from EfficientLoFTR package: ' + str(e))
+
+    # choose config
+    if model_type == 'full':
+        _cfg = full_default_cfg.copy()
+    else:
+        _cfg = opt_default_cfg.copy()
+
+    if precision == 'mp':
+        _cfg['mp'] = True
+    elif precision == 'fp16':
+        _cfg['half'] = True
+
+    matcher = LoFTR(config=_cfg)
+
+    ckpt_path = Path(weights_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f'LoFTR checkpoint not found: {ckpt_path}')
+
+    # Safe-loading: try weights_only if available
+    try:
+        ckpt = torch.load(str(ckpt_path), map_location='cpu', weights_only=False)
+    except TypeError:
+        try:
+            from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
+            torch.serialization.add_safe_globals([ModelCheckpoint])
+        except Exception:
+            pass
+        ckpt = torch.load(str(ckpt_path), map_location='cpu')
+
+    state = ckpt.get('state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
+
+    def _strip_prefix(sd, prefix):
+        return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+
+    if isinstance(state, dict):
+        if any(k.startswith('module.') for k in state.keys()):
+            state = _strip_prefix(state, 'module.')
+        elif any(k.startswith('model.') for k in state.keys()):
+            state = _strip_prefix(state, 'model.')
+
+    matcher.load_state_dict(state)
+    matcher = reparameter(matcher)
+    if precision == 'fp16':
+        matcher = matcher.half()
+
+    matcher = matcher.eval()
+    if torch.cuda.is_available():
+        matcher = matcher.cuda()
+
+    _LOFTR_MATCHER = matcher
+    _LOFTR_PRECISION = precision
+    return _LOFTR_MATCHER
+
+
+def run_loftr_match(img0: np.ndarray, img1: np.ndarray, mask0: Optional[np.ndarray] = None, mask1: Optional[np.ndarray] = None):
+    """Run the initialized LoFTR matcher on two images with optional mask support.
+    
+    Args:
+        img0, img1: RGB/grayscale images (H, W, 3) or (H, W)
+        mask0, mask1: Optional binary masks (H, W) uint8. If provided, images are cropped to mask bbox before matching.
+    
+    Returns (mkpts0, mkpts1, mconf) as numpy arrays (Nx2, Nx2, N) in ORIGINAL image coordinates.
+    """
+    global _LOFTR_MATCHER
+    if _LOFTR_MATCHER is None:
+        raise RuntimeError('LoFTR matcher not initialized (call init_loftr)')
+
+    # Crop to mask bbox if provided to exclude background
+    x0_offset, y0_offset = 0, 0
+    x1_offset, y1_offset = 0, 0
+    
+    if mask0 is not None and mask0.sum() > 0:
+        ys, xs = np.where(mask0 > 0)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        img0 = img0[y0:y1, x0:x1]
+        x0_offset, y0_offset = x0, y0
+    
+    if mask1 is not None and mask1.sum() > 0:
+        ys, xs = np.where(mask1 > 0)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        img1 = img1[y0:y1, x0:x1]
+        x1_offset, y1_offset = x0, y0
+
+    # LoFTR expects HxW grayscale input in [0,1] tensors, divisible by 32
+    h0, w0 = img0.shape[:2]
+    h1, w1 = img1.shape[:2]
+    nh0 = (h0 // 32) * 32
+    nw0 = (w0 // 32) * 32
+    nh1 = (h1 // 32) * 32
+    nw1 = (w1 // 32) * 32
+    nh0 = max(nh0, 32); nw0 = max(nw0, 32)
+    nh1 = max(nh1, 32); nw1 = max(nw1, 32)
+
+    img0c = cv2.resize(img0, (nw0, nh0)) if (nh0 != h0 or nw0 != w0) else img0
+    img1c = cv2.resize(img1, (nw1, nh1)) if (nh1 != h1 or nw1 != w1) else img1
+
+    if img0c.ndim == 3:
+        img0c = cv2.cvtColor(img0c, cv2.COLOR_BGR2GRAY)
+    if img1c.ndim == 3:
+        img1c = cv2.cvtColor(img1c, cv2.COLOR_BGR2GRAY)
+
+    t0 = torch.from_numpy(img0c)[None, None].float() / 255.0
+    t1 = torch.from_numpy(img1c)[None, None].float() / 255.0
+    if torch.cuda.is_available():
+        t0 = t0.cuda(); t1 = t1.cuda()
+
+    batch = {'image0': t0, 'image1': t1}
+    with torch.no_grad():
+        _LOFTR_MATCHER(batch)
+    mkpts0 = batch['mkpts0_f'].cpu().numpy()
+    mkpts1 = batch['mkpts1_f'].cpu().numpy()
+    mconf = batch['mconf'].cpu().numpy()
+    
+    # Translate points back to original image coordinates
+    if x0_offset != 0 or y0_offset != 0:
+        mkpts0[:, 0] += x0_offset
+        mkpts0[:, 1] += y0_offset
+    if x1_offset != 0 or y1_offset != 0:
+        mkpts1[:, 0] += x1_offset
+        mkpts1[:, 1] += y1_offset
+    
+    return mkpts0, mkpts1, mconf
 
 
 def estimate_transform_affine_masked(src: np.ndarray,
@@ -191,11 +354,74 @@ def estimate_translation_masked(src: np.ndarray,
                                  tar: np.ndarray,
                                  mask_src: Optional[np.ndarray],
                                  mask_tar: Optional[np.ndarray],
-                                 inlier_thresh: float = 12.0) -> Optional[np.ndarray]:
+                                 inlier_thresh: float = 12.0,
+                                 debug_save: bool = False,
+                                 debug_path: Optional[Path] = None) -> Optional[np.ndarray]:
     gray1 = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(tar, cv2.COLOR_BGR2GRAY)
 
     det, det_name = get_detector()
+
+    # If LoFTR is selected, run that matcher path
+    if det_name == 'LOFTR':
+        # Ensure LoFTR matcher is initialized if weights were provided via global
+        loftr_weights = globals().get('_LOFTR_WEIGHTS', None)
+        if loftr_weights is not None and globals().get('_LOFTR_MATCHER', None) is None:
+            try:
+                init_loftr(loftr_weights)
+            except Exception as e:
+                print(f"  -> LoFTR init failed: {e}")
+                return None
+
+        try:
+            mkpts0, mkpts1, mconf = run_loftr_match(src, tar, mask_src, mask_tar)
+        except Exception as e:
+            print(f"  -> LoFTR matching error: {e}")
+            return None
+
+        if mkpts0 is None or mkpts1 is None or len(mkpts0) < 3:
+            return None
+
+        deltas = mkpts1 - mkpts0
+        dx = float(np.median(deltas[:, 0]))
+        dy = float(np.median(deltas[:, 1]))
+        residuals = deltas - np.array([dx, dy], dtype=np.float32)
+        dist = np.linalg.norm(residuals, axis=1)
+        inliers = dist <= inlier_thresh
+        nin = int(np.count_nonzero(inliers))
+        if nin < 3:
+            return None
+        # Recompute dx/dy from inliers
+        dx = float(np.median(deltas[inliers, 0]))
+        dy = float(np.median(deltas[inliers, 1]))
+
+        # Debug visualization: side-by-side with line segments for inliers
+        if debug_save and debug_path is not None:
+            pts0 = mkpts0[inliers]
+            pts1 = mkpts1[inliers]
+            h0, w0 = gray1.shape[:2]
+            h1, w1 = gray2.shape[:2]
+            canvas = np.zeros((max(h0, h1), w0 + w1, 3), dtype=np.uint8)
+            canvas[:h0, :w0, 0] = gray1
+            canvas[:h1, w0:w0 + w1, 0] = gray2
+            # draw lines
+            for (x0, y0), (x1, y1) in zip(pts0.tolist(), pts1.tolist()):
+                pt1 = (int(round(x0)), int(round(y0)))
+                pt2 = (int(round(x1 + w0)), int(round(y1)))
+                cv2.circle(canvas, pt1, 2, (0, 255, 0), -1)
+                cv2.circle(canvas, pt2, 2, (0, 255, 0), -1)
+                cv2.line(canvas, pt1, pt2, (255, 0, 0), 1)
+            try:
+                cv2.imwrite(str(debug_path), canvas)
+            except Exception:
+                pass
+
+        H = np.eye(3, dtype=np.float32)
+        H[0, 2] = dx
+        H[1, 2] = dy
+        return H
+
+    # Fallback: classic detector route (SIFT/ORB/etc.)
     mask_src_u8 = mask_src if mask_src is not None else np.ones(gray1.shape, dtype=np.uint8) * 255
     mask_tar_u8 = mask_tar if mask_tar is not None else np.ones(gray2.shape, dtype=np.uint8) * 255
 
@@ -231,6 +457,13 @@ def estimate_translation_masked(src: np.ndarray,
         dx = float(np.median(deltas[inliers, 0]))
         dy = float(np.median(deltas[inliers, 1]))
 
+    # Debug visualization: draw filtered matches
+    if debug_save and debug_path is not None:
+        inlier_matches = [m for i, m in enumerate(good) if inliers[i]]
+        match_img = cv2.drawMatches(src, kp1, tar, kp2, inlier_matches, None,
+                                     flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+        cv2.imwrite(str(debug_path), match_img)
+
     H = np.eye(3, dtype=np.float32)
     H[0, 2] = dx
     H[1, 2] = dy
@@ -247,78 +480,11 @@ def is_reasonable_transform(H: Optional[np.ndarray],
     return min_scale <= s <= max_scale
 
 
-def _vertical_min_error_seam(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Compute vertical minimal-error seam mask selecting pixels from b to the right of the seam.
-
-    Returns mask_new (uint8) same shape as a[...,0], with 1 where we take from b, 0 from a.
-    """
-    # Use gradient magnitude + color difference as cost
-    # This makes seam avoid edges while considering color mismatches
-    ag = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
-    bg = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
-    
-    # Gradient magnitude: seam should avoid high-gradient areas (edges, text)
-    grad_a_x = cv2.Sobel(ag, cv2.CV_32F, 1, 0, ksize=3)
-    grad_a_y = cv2.Sobel(ag, cv2.CV_32F, 0, 1, ksize=3)
-    grad_b_x = cv2.Sobel(bg, cv2.CV_32F, 1, 0, ksize=3)
-    grad_b_y = cv2.Sobel(bg, cv2.CV_32F, 0, 1, ksize=3)
-    
-    mag_a = np.sqrt(grad_a_x**2 + grad_a_y**2)
-    mag_b = np.sqrt(grad_b_x**2 + grad_b_y**2)
-    grad_cost = (mag_a + mag_b) / 2.0  # Average gradient magnitude
-    
-    # Color difference cost: penalize mismatches
-    color_diff = cv2.absdiff(ag, bg).astype(np.float32)
-    
-    # Combined cost: gradient (prefer low-gradient areas) + color difference
-    # Weight gradient higher to prioritize smooth areas
-    diff = grad_cost * 2.0 + color_diff + 1.0  # avoid zeros
-    
-    h, w = diff.shape
-    if w <= 2 or h <= 2:
-        return np.ones((h, w), dtype=np.uint8)  # default to new on narrow region
-
-    dp = np.zeros_like(diff)
-    back = np.zeros((h, w), dtype=np.int16)
-    dp[0, :] = diff[0, :]
-    for r in range(1, h):
-        prev = dp[r - 1]
-        # For each column, consider three predecessors
-        for c in range(w):
-            c0 = prev[c]
-            c1 = prev[c - 1] if c - 1 >= 0 else 1e9
-            c2 = prev[c + 1] if c + 1 < w else 1e9
-            if c1 <= c0 and c1 <= c2:
-                dp[r, c] = diff[r, c] + c1
-                back[r, c] = c - 1
-            elif c0 <= c1 and c0 <= c2:
-                dp[r, c] = diff[r, c] + c0
-                back[r, c] = c
-            else:
-                dp[r, c] = diff[r, c] + c2
-                back[r, c] = c + 1
-
-    # Backtrack
-    seam = np.zeros(h, dtype=np.int32)
-    seam[h - 1] = int(np.argmin(dp[h - 1]))
-    for r in range(h - 2, -1, -1):
-        seam[r] = int(back[r + 1, seam[r + 1]])
-
-    # Build mask: take from b to the right of seam
-    mask_new = np.zeros((h, w), dtype=np.uint8)
-    for r in range(h):
-        c = seam[r]
-        if c + 1 < w:
-            mask_new[r, c + 1:] = 1
-    return mask_new
-
-
 def expand_canvas(mosaic: np.ndarray,
                   h_to_canvas: np.ndarray,
                   new_img: np.ndarray,
+                  blender: ImageBlender,
                   max_size: int = 14000,
-                  blend_mode: str = 'feather',
-                  seam_width: int = 1,
                   debug_save: bool = False,
                   debug_dir: Optional[Path] = None,
                   step_name: Optional[str] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
@@ -363,107 +529,26 @@ def expand_canvas(mosaic: np.ndarray,
     only_new = mask_new & (~mask_old)
     overlap = mask_new & mask_old
 
-    # if np.any(overlap):
-    #     base_pixels = moved[overlap].astype(np.float32)
-    #     new_pixels = warped_new[overlap].astype(np.float32)
-    #     mean_base = base_pixels.mean(axis=0)
-    #     mean_new = new_pixels.mean(axis=0)
-    #     std_base = base_pixels.std(axis=0)
-    #     std_new = new_pixels.std(axis=0)
-    #     scale = np.ones(3, dtype=np.float32)
-    #     valid = std_new > 1.0
-    #     scale[valid] = std_base[valid] / np.maximum(std_new[valid], 1e-3)
-    #     scale = np.clip(scale, 0.6, 1.6)
-    #     shift = mean_base - scale * mean_new
-    #     warped_new = np.clip(
-    #         warped_new.astype(np.float32) * scale[None, None, :] + shift[None, None, :],
-    #         0,
-    #         255,
-    #     ).astype(np.uint8)
-
-    if np.any(only_new):
-        out[only_new] = warped_new[only_new]
-    seam_mask_full = None
+    # Use the blender module for all blending operations
     if np.any(overlap):
-        if blend_mode == 'none':
-            # Hard cut: prefer new where overlap
-            out[overlap] = warped_new[overlap]
-        elif blend_mode == 'seam':
-            # Compute minimal-error vertical seam within overlap bbox
-            ys, xs = np.where(overlap)
+        # Find overlap bounding box for optimization
+        ys, xs = np.where(overlap)
+        if len(ys) > 0:
             y0, y1 = int(ys.min()), int(ys.max()) + 1
             x0, x1 = int(xs.min()), int(xs.max()) + 1
-            subA = moved[y0:y1, x0:x1]
-            subB = warped_new[y0:y1, x0:x1]
-            mask_sub = overlap[y0:y1, x0:x1]
-            # If too thin, fallback to feather
-            if (x1 - x0) < 8 or (y1 - y0) < 8:
-                blend_mode_local = 'feather'
-            else:
-                blend_mode_local = 'seam'
-            if blend_mode_local == 'seam':
-                seam_mask = _vertical_min_error_seam(subA, subB).astype(np.uint8)
-                # build full-size seam mask for debugging (placed at bbox)
-                if debug_save and debug_dir is not None:
-                    seam_mask_full = np.zeros((new_h, new_w), dtype=np.uint8)
-                    seam_mask_full[y0:y1, x0:x1] = (seam_mask * 255).astype(np.uint8)
-                # Keep only inside overlap
-                seam_mask = (seam_mask & mask_sub.astype(np.uint8))
-                # Create float mask and optionally smooth horizontally to avoid abrupt breaks
-                fmask = seam_mask.astype(np.float32)
-                if seam_width is None:
-                    sw = 1
-                else:
-                    sw = int(max(1, seam_width))
-                if sw > 1:
-                    kx = sw * 2 + 1
-                    # Minimal horizontal blur to soften hard seam edge
-                    fmask = cv2.GaussianBlur(fmask, (kx, 1), sigmaX=sw * 0.5)
-                    # Normalize to [0,1]
-                    maxv = float(fmask.max()) if fmask.max() > 0 else 1.0
-                    fmask = fmask / maxv
-                else:
-                    # binary -> 0/1
-                    fmask = (fmask > 0).astype(np.float32)
-
-                # Build blended subregion using soft alpha mask
-                alpha = fmask[..., None]
-                subA_f = subA.astype(np.float32)
-                subB_f = subB.astype(np.float32)
-                blended = (subA_f * (1.0 - alpha) + subB_f * alpha).astype(np.uint8)
-                sub_out = out[y0:y1, x0:x1]
-                # Where mask_sub is True, write blended; else leave original
-                sub_out[mask_sub] = blended[mask_sub]
-                out[y0:y1, x0:x1] = sub_out
-            else:
-                # Feather in bbox as fallback
-                mask_new_u8 = warped_mask_new[y0:y1, x0:x1].astype(np.uint8)
-                mask_old_u8 = moved_mask[y0:y1, x0:x1].astype(np.uint8)
-                dist_new = cv2.distanceTransform(mask_new_u8, cv2.DIST_L2, 5).astype(np.float32)
-                dist_old = cv2.distanceTransform(mask_old_u8, cv2.DIST_L2, 5).astype(np.float32)
-                dist_new = cv2.GaussianBlur(dist_new, (0, 0), sigmaX=6, sigmaY=6)
-                dist_old = cv2.GaussianBlur(dist_old, (0, 0), sigmaX=6, sigmaY=6)
-                denom = dist_new + dist_old + 1e-6
-                w_new = dist_new / denom
-                w_old = 1.0 - w_new
-                blended = subA.astype(np.float32) * w_old[..., None] + subB.astype(np.float32) * w_new[..., None]
-                sub_out = out[y0:y1, x0:x1]
-                sub_bl = np.clip(blended, 0, 255).astype(np.uint8)
-                sub_out[mask_sub] = sub_bl[mask_sub]
-                out[y0:y1, x0:x1] = sub_out
+            overlap_bbox = (y0, y1, x0, x1)
         else:
-            # Default feather blending (as before, full-frame)
-            mask_new_u8 = warped_mask_new.astype(np.uint8)
-            mask_old_u8 = moved_mask.astype(np.uint8)
-            dist_new = cv2.distanceTransform(mask_new_u8, cv2.DIST_L2, 5).astype(np.float32)
-            dist_old = cv2.distanceTransform(mask_old_u8, cv2.DIST_L2, 5).astype(np.float32)
-            dist_new = cv2.GaussianBlur(dist_new, (0, 0), sigmaX=6, sigmaY=6)
-            dist_old = cv2.GaussianBlur(dist_old, (0, 0), sigmaX=6, sigmaY=6)
-            denom = dist_new + dist_old + 1e-6
-            w_new = dist_new / denom
-            w_old = 1.0 - w_new
-            blended = moved.astype(np.float32) * w_old[..., None] + warped_new.astype(np.float32) * w_new[..., None]
-            out[overlap] = np.clip(blended, 0, 255).astype(np.uint8)[overlap]
+            overlap_bbox = None
+        
+        # Perform blending using the ImageBlender
+        blend_result = blender.blend(moved, warped_new, mask_old, mask_new, overlap_bbox)
+        out = blend_result.blended
+        seam_mask_full = blend_result.seam_mask
+    else:
+        # No overlap, just copy new pixels
+        if np.any(only_new):
+            out[only_new] = warped_new[only_new]
+        seam_mask_full = None
 
     # If requested, write debug files: moved (mosaic before), warped_new (new warped), seam mask
     if debug_save and debug_dir is not None:
@@ -519,6 +604,9 @@ def stitch_incremental_with_corners(image_paths: List[Path],
     base = cv2.imread(str(image_paths[0]))
     if base is None:
         raise FileNotFoundError(image_paths[0])
+
+    # Initialize the blender with specified mode and parameters
+    blender = ImageBlender(mode=blend, seam_width=seam_width, feather_sigma=6.0, min_seam_size=8)
 
     # Initialize mosaic with first image
     mosaic = base.copy()
@@ -580,8 +668,16 @@ def stitch_incremental_with_corners(image_paths: List[Path],
         # Estimate transform between current frame and mosaic
         H = None
         tmode = (transform or 'translation').lower()
+        
+        # Prepare debug path for match visualization
+        match_debug_path = None
+        if debug_save and debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            match_debug_path = debug_dir / f"{k:03d}_{cur_path.stem}_matches.jpg"
+        
         if tmode == 'translation':
-            H = estimate_translation_masked(cur_img, mosaic, cur_mask, mosaic_mask)
+            H = estimate_translation_masked(cur_img, mosaic, cur_mask, mosaic_mask,
+                                           debug_save=debug_save, debug_path=match_debug_path)
         elif tmode == 'affine':
             H = estimate_transform_affine_masked(cur_img, mosaic, cur_mask, mosaic_mask)
         elif tmode in ('homography', 'h'): 
@@ -624,7 +720,7 @@ def stitch_incremental_with_corners(image_paths: List[Path],
         # Expand canvas and warp current frame into it
         step_name = f"{k}_{cur_path.stem}"
         mosaic_new, T, seam_mask = expand_canvas(
-            mosaic, H, cur_img, blend_mode=blend, seam_width=seam_width,
+            mosaic, H, cur_img, blender,
             debug_save=debug_save, debug_dir=debug_dir, step_name=step_name)
         if mosaic_new is None:
             print("  -> Canvas overflow; skipping frame")
@@ -665,8 +761,8 @@ def main():
     ap.add_argument('--seam-width', type=int, default=1, help='Soft seam width in pixels (horizontal blur)')
     ap.add_argument('--detector', type=str, default=None, choices=['sift', 'orb', 'akaze', 'kaze'],
                     help='Force which feature detector to use during matching')
-    ap.add_argument('--reverse', action='store_true',
-                    help='Process frames in descending index order (right-to-left stitching)')
+    ap.add_argument('--loftr-weights', type=str, default=None,
+                    help='Path to EfficientLoFTR checkpoint to use (enables LOFTR)')
     ap.add_argument('--debug-steps', action='store_true', help='Save per-step debug images (moved/warped/seam/mosaic)')
     ap.add_argument('--debug-dir', type=str, default=None, help='Directory to save debug-step images')
     args = ap.parse_args()
@@ -688,9 +784,6 @@ def main():
     else:
         ordered = sorted(idxs)
 
-    if args.reverse:
-        ordered = list(reversed(ordered))
-
     image_paths = [aligned_dir / f"{i}_aligned.jpg" for i in ordered]
     corner_paths = [corners_dir / f"{i}{args.corners_suffix}" for i in ordered]
 
@@ -706,6 +799,10 @@ def main():
     # Respect detector override if provided
     if args.detector:
         globals()['_FORCE_DET'] = args.detector
+    # Respect LoFTR option: when weights provided, force LOFTR
+    if args.loftr_weights:
+        globals()['_LOFTR_WEIGHTS'] = str(args.loftr_weights)
+        globals()['_FORCE_DET'] = 'loftr'
 
     mosaic = stitch_incremental_with_corners(
         image_paths,

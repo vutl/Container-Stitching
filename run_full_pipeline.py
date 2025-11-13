@@ -45,29 +45,70 @@ def main():
     ap.add_argument('--blend', type=str, default='seam', choices=['feather', 'seam', 'none'], help='Blend mode (default: seam)')
     ap.add_argument('--seam-width', type=int, default=8, help='Seam blend width (default: 8)')
     ap.add_argument('--lock-dy', action='store_true', help='Force vertical translation to zero')
+    ap.add_argument('--loftr-weights', type=str, default=None, help='Path to EfficientLoFTR checkpoint to use for matching')
     
     args = ap.parse_args()
     
-    img_dir = Path(args.img_dir).resolve()
-    if not img_dir.exists():
-        print(f"ERROR: Image directory not found: {img_dir}")
+    container_dir = Path(args.img_dir).resolve()
+    if not container_dir.exists():
+        print(f"ERROR: Input directory not found: {container_dir}")
         sys.exit(1)
     
     base_dir = Path(__file__).parent.resolve()
     
-    # Define output folders (all within img_dir)
-    split_c1 = img_dir / 'split_c1'
-    split_c2 = img_dir / 'split_c2'
-    trimmed_c1 = img_dir / 'trimmed_c1'
-    trimmed_c2 = img_dir / 'trimmed_c2'
-    trimmed_corners_c1 = img_dir / 'trimmed_corners_c1'
-    trimmed_corners_c2 = img_dir / 'trimmed_corners_c2'
-    aligned_c1 = img_dir / 'aligned_c1'
-    aligned_c2 = img_dir / 'aligned_c2'
-    rectified_c1 = img_dir / 'rectified_c1'
-    rectified_c2 = img_dir / 'rectified_c2'
-    panorama_c1 = img_dir / 'panorama_c1'
-    panorama_c2 = img_dir / 'panorama_c2'
+    # Step 0: Detect direction using YOLO corner positions
+    print("\n" + "="*60)
+    print("STEP 0: Detect container direction")
+    print("="*60)
+    find_direction_cmd = [
+        sys.executable, str(base_dir / 'find_direction.py'),
+        '--dir', str(container_dir),
+        '--suffix', args.img_suffix,
+        '--model', args.model,
+        '--conf', str(args.conf),
+        '--iou', str(args.iou),
+    ]
+    print(f"Command: {' '.join(find_direction_cmd)}")
+    result = subprocess.run(find_direction_cmd, check=False)
+    if result.returncode != 0:
+        print("WARNING: Direction detection failed, assuming left-to-right")
+    
+    # Read direction.txt to determine image source folder
+    direction_file = container_dir / 'direction.txt'
+    is_right_to_left = False
+    img_dir = container_dir  # Default: use container folder
+    
+    if direction_file.exists():
+        direction = direction_file.read_text().strip().lower().replace('_', '-')
+        is_right_to_left = (direction == 'right-to-left')
+        
+        if is_right_to_left:
+            # Use reversed images from img_rev folder
+            img_rev = container_dir / 'img_rev'
+            if img_rev.exists() and img_rev.is_dir():
+                img_dir = img_rev
+                print(f"[DIRECTION] RIGHT-TO-LEFT detected → Using reversed images: {img_rev}")
+            else:
+                print(f"[DIRECTION] WARNING: img_rev folder not found, using original folder")
+        else:
+            print(f"[DIRECTION] LEFT-TO-RIGHT detected → Using original images: {container_dir}")
+    else:
+        print("[DIRECTION] direction.txt not found: assuming left-to-right")
+    
+    # All output folders are created relative to the container_dir (not img_dir)
+    # This ensures output is always in the same place regardless of direction
+    split_c1 = container_dir / 'split_c1'
+    split_c2 = container_dir / 'split_c2'
+    trimmed_c1 = container_dir / 'trimmed_c1'
+    trimmed_c2 = container_dir / 'trimmed_c2'
+    trimmed_corners_c1 = container_dir / 'trimmed_corners_c1'
+    trimmed_corners_c2 = container_dir / 'trimmed_corners_c2'
+    aligned_c1 = container_dir / 'aligned_c1'
+    aligned_c2 = container_dir / 'aligned_c2'
+    rectified_c1 = container_dir / 'rectified_c1'
+    rectified_c2 = container_dir / 'rectified_c2'
+    panorama_c1 = container_dir / 'panorama_c1'
+    panorama_c2 = container_dir / 'panorama_c2'
     
     # Step 1: Corner detection & split
     run_cmd([
@@ -82,13 +123,6 @@ def main():
     ], "1. Corner detection & split")
     
     # Determine indices from split output
-    c1_files = sorted(split_c1.glob('*_corners.txt'))
-    c2_files = sorted(split_c2.glob('*_corners.txt'))
-    
-    if not c1_files:
-        print("ERROR: No corners found in C1 after split. Check detection step.")
-        sys.exit(1)
-    
     # Extract indices from filenames like "img_0_corners.txt" or "0_corners.txt"
     def extract_index(f):
         parts = f.stem.split('_')
@@ -96,6 +130,14 @@ def main():
             if p.isdigit():
                 return int(p)
         return None
+    
+    # Sort by numeric index instead of lexicographic to avoid img_1 < img_10 < img_2
+    c1_files = sorted(split_c1.glob('*_corners.txt'), key=lambda f: extract_index(f) or 0)
+    c2_files = sorted(split_c2.glob('*_corners.txt'), key=lambda f: extract_index(f) or 0)
+    
+    if not c1_files:
+        print("ERROR: No corners found in C1 after split. Check detection step.")
+        sys.exit(1)
     
     c1_indices = [extract_index(f) for f in c1_files]
     c2_indices = [extract_index(f) for f in c2_files]
@@ -106,19 +148,6 @@ def main():
     c2_range = f"{min(c2_indices)}-{max(c2_indices)}" if c2_indices else ""
     
     has_c2 = len(c2_indices) > 0
-    
-    # Read direction info from detection step
-    direction_file = img_dir / 'direction.txt'
-    needs_reverse = False
-    if direction_file.exists():
-        direction = direction_file.read_text().strip()
-        needs_reverse = (direction == 'right_to_left')
-        if needs_reverse:
-            print(f"\n[DIRECTION] Detected RIGHT→LEFT: Will stitch in reverse order (img_{max(c1_indices)}→img_{min(c1_indices)})")
-        else:
-            print(f"\n[DIRECTION] Detected LEFT→RIGHT: Will stitch in normal order (img_{min(c1_indices)}→img_{max(c1_indices)})")
-    else:
-        print("\nWarning: direction.txt not found, assuming left_to_right")
     
     print(f"\nDetected indices:")
     print(f"  C1: {c1_range} ({len(c1_indices)} frames)")
@@ -186,9 +215,6 @@ def main():
     run_cmd(rectify_cmd, "4. Rectify to rectangles")
     
     # Determine actual aligned indices from rectified output
-    rectified_c1_files = sorted(rectified_c1.glob('*_aligned.jpg'))
-    rectified_c2_files = sorted(rectified_c2.glob('*_aligned.jpg')) if has_c2 else []
-    
     def extract_aligned_index(f):
         # Extract index from "0_aligned.jpg" or "img_0_aligned.jpg"
         stem = f.stem  # "0_aligned" or "img_0_aligned"
@@ -198,6 +224,10 @@ def main():
                 return int(p)
         return None
     
+    # Sort by numeric index instead of lexicographic
+    rectified_c1_files = sorted(rectified_c1.glob('*_aligned.jpg'), key=lambda f: extract_aligned_index(f) or 0)
+    rectified_c2_files = sorted(rectified_c2.glob('*_aligned.jpg'), key=lambda f: extract_aligned_index(f) or 0) if has_c2 else []
+    
     rectified_c1_indices = [extract_aligned_index(f) for f in rectified_c1_files]
     rectified_c1_indices = [i for i in rectified_c1_indices if i is not None]
     
@@ -206,8 +236,14 @@ def main():
         rectified_c2_indices = [i for i in rectified_c2_indices if i is not None]
     
     # Build comma-separated indices for stitching (only actual frames)
-    c1_stitch_indices = ','.join(map(str, sorted(rectified_c1_indices)))
-    c2_stitch_indices = ','.join(map(str, sorted(rectified_c2_indices))) if has_c2 else ""
+    # Note: For right-to-left containers, find_direction.py already reversed the indices
+    # in img_rev folder (img_74→img_0, img_73→img_1, etc.), so we ALWAYS stitch in
+    # ascending numeric order (img_0→img_n) regardless of original camera direction.
+    c1_stitch_list = sorted(rectified_c1_indices)
+    c2_stitch_list = sorted(rectified_c2_indices) if has_c2 else []
+    
+    c1_stitch_indices = ','.join(map(str, c1_stitch_list))
+    c2_stitch_indices = ','.join(map(str, c2_stitch_list)) if c2_stitch_list else ""
     
     print(f"\nRectified frames for stitching:")
     print(f"  C1: {len(rectified_c1_indices)} frames - indices: {c1_stitch_indices}")
@@ -325,10 +361,14 @@ def main():
         stitch_cmd = None
 
     if stitch_cmd:
+        # If user supplied LoFTR weights, forward that; otherwise default to SIFT
+        if getattr(args, 'loftr_weights', None):
+            stitch_cmd.extend(['--loftr-weights', str(args.loftr_weights)])
+        else:
+            stitch_cmd.extend(['--detector', 'sift'])
+
         if args.lock_dy:
             stitch_cmd.append('--lock-dy')
-        if needs_reverse:
-            stitch_cmd.append('--reverse')
         run_cmd(stitch_cmd, "5. Stitch panoramas")
     
     print(f"\n{'='*60}")
@@ -340,7 +380,7 @@ def main():
         print(f"  Panorama C2: {panorama_c2}/panorama_*_bbox.jpg")
     else:
         print(f"  Panorama C2: (skipped - single container)")
-    print(f"\nAll intermediate outputs in: {img_dir}/")
+    print(f"\nAll intermediate outputs in: {container_dir}/")
 
 
 if __name__ == '__main__':

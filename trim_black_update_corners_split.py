@@ -16,7 +16,22 @@ import trim_black_update_corners as base
 
 
 def _iter_indices(img_dir: Path, suffix: str):
-    for p in sorted(img_dir.glob(f"*{suffix}")):
+    """Iterate files in numeric order (img_0, img_1, ..., img_n), not lexicographic."""
+    import re
+    
+    def extract_numeric_index(p: Path) -> int:
+        """Extract trailing numeric index from filename stem."""
+        stem = p.stem
+        match = re.search(r'(\d+)$', stem)
+        if match:
+            return int(match.group(1))
+        # Fallback: if stem is purely numeric
+        if stem.isdigit():
+            return int(stem)
+        # Non-numeric files sort last
+        return 999999
+    
+    for p in sorted(img_dir.glob(f"*{suffix}"), key=extract_numeric_index):
         name = p.name
         stem = name[:-len(suffix)] if name.endswith(suffix) else p.stem
         if stem.isdigit():

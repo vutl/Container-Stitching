@@ -34,9 +34,13 @@ NUM_RE = re.compile(r"^(.*?)(\d+)$")
 def find_indexed_files(d: Path, suffix: str) -> List[Tuple[Path, int, str]]:
     """Return list of (path, index, prefix) for files in dir matching suffix
     and whose stem ends with digits. Sorted by index ascending.
+    Skip stitch_img_*.jpg (stitched result samples).
     """
     out = []
     for p in sorted(d.glob(f"*{suffix}")):
+        # Skip stitched result samples
+        if p.name.startswith('stitch_img_') or p.name.startswith('stitch_'):
+            continue
         stem = p.stem
         m = NUM_RE.match(stem)
         if not m:
